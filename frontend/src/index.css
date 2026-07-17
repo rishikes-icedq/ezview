@@ -1,0 +1,80 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #334155;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* MDEditor dark theme override — MDEditor has its own light/dark theming
+   via the data-color-mode attribute (see MarkdownEditor.tsx), so its
+   default light-mode styling is left untouched here. Only dark mode needs
+   overriding. */
+.dark .w-md-editor {
+  background-color: #0f172a !important;
+  border: none !important;
+  border-radius: 0 !important;
+}
+.dark .w-md-editor-toolbar {
+  background-color: #1e293b !important;
+  border-bottom: 1px solid #1e293b !important;
+}
+.dark .w-md-editor-toolbar li button {
+  color: #94a3b8 !important;
+}
+.dark .w-md-editor-toolbar li button:hover {
+  color: #fff !important;
+  background-color: #334155 !important;
+}
+/* No background here: .w-md-editor-text-input is an absolutely-positioned,
+   transparent-text textarea stacked on top of .w-md-editor-text-pre's
+   syntax-highlighted <pre>. Giving the textarea an opaque background would
+   paint over the highlighted text underneath, since only the caret and
+   selection are meant to render from the textarea itself. */
+.dark .w-md-editor-text-pre, .dark .w-md-editor-text-input {
+  color: #e2e8f0 !important;
+}
+.dark .wmde-markdown {
+  background-color: #1e293b !important;
+  color: #e2e8f0 !important;
+}
+.dark .wmde-markdown h1, .dark .wmde-markdown h2, .dark .wmde-markdown h3 {
+  color: #f1f5f9;
+  border-bottom-color: #334155;
+}
+.dark .wmde-markdown code {
+  background-color: #0f172a;
+  color: #a5f3fc;
+}
+.dark .wmde-markdown pre {
+  background-color: #0f172a !important;
+}
+.dark .wmde-markdown blockquote {
+  border-left-color: #6366f1;
+  color: #94a3b8;
+}
+.dark .wmde-markdown a {
+  color: #818cf8;
+}

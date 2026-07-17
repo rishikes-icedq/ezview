@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+frontend/node_modules/
+frontend/dist/
+
+*.tmp
+.pytest_cache/
+.mypy_cache/
+
+# Agent context file (local only — do not commit)
+CLAUDE.md
