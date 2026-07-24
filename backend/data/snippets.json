@@ -1,0 +1,113 @@
+{
+  "collections": [
+    {
+      "id": "c1",
+      "title": "Lineage",
+      "groups": [
+        {
+          "id": "g1",
+          "title": "Snowflake Lineage",
+          "snippets": [
+            {
+              "id": "s1",
+              "title": "Stage 1",
+              "content": "python scripts/run_stage1.py staged_output/snowflake/queries.json `\n  --source-platform snowflake `\n  --extraction-start 2026-07-14T00:00:00+00:00 `\n  --extraction-end   2026-07-15T00:00:00+00:00"
+            },
+            {
+              "id": "s2",
+              "title": "Stage 2",
+              "content": "python scripts/run_stage2.py staged_output/snowflake/queries.json staged_output/snowflake/stage2 `\n  --icedq-workspace-id  wksc-60e00eb8-2cbd-5136-bc8a-793c9c633856 `\n  --icedq-connection-id conn-6cb6c49f-7231-5323-9190-82d8a6998afb"
+            },
+            {
+              "id": "s3",
+              "title": "Stage 3",
+              "content": "python scripts/run_stage3.py staged_output/snowflake/stage2 staged_output/snowflake/lineage `\n  --system-name lineagesys660 `\n  --manifest-path staged_output/snowflake/queries.json"
+            },
+            {
+              "id": "a56b44fb-b159-47f3-a12a-97947873a24b",
+              "title": "Stage 4",
+              "content": "python scripts/run_stage4.py staged_output/snowflake/lineage/manifest.json"
+            }
+          ]
+        },
+        {
+          "id": "59119c40-6ef0-40d1-ba0b-e53e6b62f23f",
+          "title": "GBQ Lineage",
+          "snippets": [
+            {
+              "id": "63c7a77a-38d6-4548-a8c8-d4555ed68a77",
+              "title": "Stage 1",
+              "content": "python scripts/run_stage1.py staged_output/gbq/queries.json `\n  --source-platform bigquery `\n  --extraction-start 2026-06-01T00:00:00+00:00 `\n  --extraction-end   2026-07-07T00:00:00+00:00"
+            },
+            {
+              "id": "2525fae1-9b84-434a-b96f-3dad38f3ad83",
+              "title": "Stage 2",
+              "content": "python scripts/run_stage2.py staged_output/gbq/queries.json staged_output/gbq/stage2 `\n  --icedq-workspace-id=wksc-60e00eb8-2cbd-5136-bc8a-793c9c633856 `\n  --icedq-connection-id=conn-f5b29b15-b7bf-5818-97e3-51f383fad375"
+            },
+            {
+              "id": "1e42b072-4990-419c-99b5-6570cfc5f5b6",
+              "title": "Stage 3",
+              "content": "python scripts/run_stage3.py staged_output/gbq/stage2 staged_output/gbq/lineage `\n  --system-name lineagesys660 `\n  --manifest-path staged_output/gbq/queries.json"
+            }
+          ]
+        },
+        {
+          "id": "a95fb0bc-4b5a-4e2b-a71e-f552c8d73ec6",
+          "title": "SQL Server Lineage",
+          "snippets": [
+            {
+              "id": "c3331df2-ea7f-4371-8950-5a176875f7a0",
+              "title": "Stage 1",
+              "content": "python scripts/run_stage1.py staged_output/sqlserver/queries.json `\n  --source-platform sql-server `\n  --extraction-start 2026-05-01T00:00:00+00:00 `\n  --extraction-end   2026-07-01T00:00:00+00:00"
+            },
+            {
+              "id": "4defcd8d-a849-480d-8ebf-abde3bfb9714",
+              "title": "Stage 2",
+              "content": "python scripts/run_stage2.py staged_output/sqlserver/queries.json staged_output/sqlserver/stage2 `\n  --icedq-workspace-id=wksc-60e00eb8-2cbd-5136-bc8a-793c9c633856 `\n  --icedq-connection-id=conn-294241ac-43ec-535a-af2d-cf098e75a219"
+            },
+            {
+              "id": "c06f520f-5aa5-43e0-9658-50e459d0f44c",
+              "title": "Stage 3",
+              "content": "python scripts/run_stage3.py staged_output/sqlserver/stage2 staged_output/sqlserver/lineage `\n  --system-name lineagesys660 `\n  --manifest-path staged_output/sqlserver/queries.json"
+            }
+          ]
+        },
+        {
+          "id": "6b2da6ab-3c31-4911-8875-7a890f1f8ba6",
+          "title": "Configs",
+          "snippets": [
+            {
+              "id": "2988e40c-7eb0-447d-b94a-a6e94f011265",
+              "title": ".env PROD",
+              "content": "EXTRACTION_MODE=deterministic\nTEMPORAL_HOST=icedq-temporal-frontend.default.svc.cluster.local:7233\nTEMPORAL_NAMESPACE=default\nTEMPORAL_TASK_QUEUE=lineage.crawl.activity.queue\n\n## For testing\nTEMPORAL_HOST=192.168.100.90:7233"
+            }
+          ]
+        }
+      ],
+      "snippets": []
+    },
+    {
+      "id": "c2",
+      "title": "Temporal",
+      "groups": [
+        {
+          "id": "05207a40-757d-46ee-862a-8a052ab0a1eb",
+          "title": "Temporal UI",
+          "snippets": [
+            {
+              "id": "2be47c8d-a575-4099-b2a0-da686f3f33ac",
+              "title": "Temporal Web UI",
+              "content": "http://192.168.100.90:8080/"
+            },
+            {
+              "id": "e14b32ce-4277-4333-9180-aa07ed0b2d04",
+              "title": "Run workflow Parameters",
+              "content": "Workflow ID: lineage-pipeline-\nWorkflow Type: LineageExtractionWorkflow\nTask Queue: test.lineage.crawl.activity.queue\n\nJSON\n{\n  \"utility_name\": \"snowflake-lineage-extractor\",\n  \"run_id\": \"run-001\",\n  \"base_path\": \"C:/Users/RishikeshShede/OneDrive - Torana Inc/Documents/code/data-lineage/staged_output/test-temporal\",\n  \"parameters\": {\n    \"SOURCE_PLATFORM\": \"snowflake\",\n    \"SYSTEM_NAME\": \"lineage_snowflake\",\n    \"EXTRACTION_START\": \"2026-07-15T00:00:00+00:00\",\n    \"EXTRACTION_END\":   \"2026-07-15T23:59:59+00:00\",\n    \"ICEDQ_WORKSPACE_ID\": \"wksc-60e00eb8-2cbd-5136-bc8a-793c9c633856\",\n    \"ICEDQ_CONNECTION_ID\": \"conn-6cb6c49f-7231-5323-9190-82d8a6998afb\",\n    \"STAGE3_INPUT_DIR\": \"C:/Users/RishikeshShede/OneDrive - Torana Inc/Documents/code/data-lineage/staged_output/test-temporal/run-001/stage2\"\n  }\n}"
+            }
+          ]
+        }
+      ],
+      "snippets": []
+    }
+  ]
+}

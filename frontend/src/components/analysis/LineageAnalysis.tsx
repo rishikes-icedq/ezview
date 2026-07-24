@@ -6,7 +6,7 @@ import SummaryCards from './SummaryCards'
 import AssetTree from './AssetTree'
 import EdgeTable from './EdgeTable'
 import ProcessList from './ProcessList'
-import FlowMatrix from './FlowMatrix'
+import FlowGraph from './FlowGraph'
 
 type Tab = 'summary' | 'assets' | 'edges' | 'processes' | 'flow'
 
@@ -87,7 +87,7 @@ export default function LineageAnalysis({ folder, label }: Props) {
             {tab === 'assets'    && <AssetTree folder={folder} />}
             {tab === 'edges'     && <EdgeTable folder={folder} />}
             {tab === 'processes' && <ProcessList folder={folder} />}
-            {tab === 'flow'      && <FlowMatrix folder={folder} />}
+            {tab === 'flow'      && <FlowGraph folder={folder} />}
           </>
         ) : null}
       </div>

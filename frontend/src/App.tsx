@@ -11,6 +11,7 @@ import MarkdownEditor from './components/markdown/MarkdownEditor'
 import JsonFormatterTool from './components/tools/JsonFormatterTool'
 import SqlFormatterTool from './components/tools/SqlFormatterTool'
 import DiffTool from './components/tools/DiffTool'
+import SnippetsTool from './components/tools/snippets/SnippetsTool'
 import ColResizeHandle from './components/shared/ColResizeHandle'
 import { useResizableColumns } from './hooks/useResizableColumns'
 import { useTheme } from './contexts/ThemeContext'
@@ -95,6 +96,7 @@ export default function App() {
     if (activeTool === 'json_formatter') return <JsonFormatterTool />
     if (activeTool === 'sql_formatter') return <SqlFormatterTool />
     if (activeTool === 'diff_tool') return <DiffTool />
+    if (activeTool === 'snippets') return <SnippetsTool />
     if (!activeView) return <EmptyState />
     const { path, action, folder, label } = activeView
 

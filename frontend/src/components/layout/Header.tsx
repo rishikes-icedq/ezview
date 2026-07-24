@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Eye, Wrench, X, Braces, Code2, FileDiff, Sun, Moon } from 'lucide-react'
+import { Eye, Wrench, X, Braces, Code2, FileDiff, BookOpen, Sun, Moon } from 'lucide-react'
 import { useTheme } from '../../contexts/ThemeContext'
 
 export interface ToolDef {
@@ -12,6 +12,7 @@ export const TOOLS: ToolDef[] = [
   { id: 'json_formatter', label: 'JSON Formatter', icon: <Braces size={13} /> },
   { id: 'sql_formatter', label: 'SQL Formatter', icon: <Code2 size={13} /> },
   { id: 'diff_tool', label: 'Diff / Compare', icon: <FileDiff size={13} /> },
+  { id: 'snippets', label: 'Snippets', icon: <BookOpen size={13} /> },
 ]
 
 interface Props {

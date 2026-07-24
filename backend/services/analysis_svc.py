@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -262,32 +263,65 @@ def get_processes(processes_df: pd.DataFrame) -> list[dict[str, Any]]:
 # Data flow pairs
 # ---------------------------------------------------------------------------
 
+def _table_key(p: dict) -> str:
+    return f"{p.get('database','')}.{p.get('schema','')}.{p.get('table','')}"
+
+
+def _process_io(edges_df: pd.DataFrame) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """For each process_fqn, collects the table keys touched as inputs
+    (resolved column/table on the source side of any of its edges) and
+    outputs (resolved column/table on the target side).
+
+    Pipelines model direct vs. process-mediated flow differently — some
+    encode a "writes_to" edge as a direct column-to-column copy with
+    process_fqn as a sidecar column, others split it into a "read_by"
+    column->process edge plus a "writes_to" process->column edge (with a
+    separate "maps_to" for direct copies). Rather than assume one convention,
+    this classifies each edge's source/target purely by whether it resolves
+    to a real column/table: any such side occurring in a row sharing a
+    process_fqn contributes to that process's input or output table set.
+    """
+    proc_inputs: dict[str, list[str]] = {}
+    proc_outputs: dict[str, list[str]] = {}
+    if "process_fqn" not in edges_df.columns:
+        return proc_inputs, proc_outputs
+
+    cols = [c for c in ("source_fqn", "target_fqn", "process_fqn") if c in edges_df.columns]
+    for row in edges_df[cols].dropna(subset=["process_fqn"]).itertuples(index=False):
+        proc = str(row.process_fqn)
+        if "source_fqn" in cols and pd.notna(row.source_fqn):
+            src = parse_fqn(str(row.source_fqn))
+            if src["type"] in ("column", "table"):
+                proc_inputs.setdefault(proc, []).append(_table_key(src))
+        if "target_fqn" in cols and pd.notna(row.target_fqn):
+            tgt = parse_fqn(str(row.target_fqn))
+            if tgt["type"] in ("column", "table"):
+                proc_outputs.setdefault(proc, []).append(_table_key(tgt))
+    return proc_inputs, proc_outputs
+
+
 def get_flow_pairs(edges_df: pd.DataFrame) -> list[dict[str, Any]]:
-    if "edge" not in edges_df.columns:
-        df = edges_df
-    else:
-        df = edges_df[edges_df["edge"] == "writes_to"]
+    """Aggregates table-to-table data flow, derived through each process's
+    inputs and outputs (see _process_io) rather than by filtering on a
+    specific "edge" label.
+    """
+    proc_inputs, proc_outputs = _process_io(edges_df)
 
     pairs: dict[tuple, dict] = {}
-    for row in df.to_dict(orient="records"):
-        src = parse_fqn(str(row.get("source_fqn") or ""))
-        tgt = parse_fqn(str(row.get("target_fqn") or ""))
-        if src["type"] not in ("column", "table") or tgt["type"] not in ("column", "table"):
+    for proc, outputs in proc_outputs.items():
+        inputs = proc_inputs.get(proc)
+        if not inputs:
             continue
-
-        def tbl(p: dict) -> str:
-            return f"{p.get('database','')}.{p.get('schema','')}.{p.get('table','')}"
-
-        s, t = tbl(src), tbl(tgt)
-        if s == t:
-            continue
-        key = (s, t)
-        if key not in pairs:
-            pairs[key] = {"source_table": s, "target_table": t, "edge_count": 0, "processes": set()}
-        pairs[key]["edge_count"] += 1
-        pf = row.get("process_fqn")
-        if pf:
-            pairs[key]["processes"].add(str(pf))
+        input_counts = Counter(inputs)
+        output_counts = Counter(outputs)
+        for src_table in input_counts:
+            for tgt_table in output_counts:
+                if src_table == tgt_table:
+                    continue
+                key = (src_table, tgt_table)
+                entry = pairs.setdefault(key, {"source_table": src_table, "target_table": tgt_table, "edge_count": 0, "processes": set()})
+                entry["edge_count"] += input_counts[src_table] + output_counts[tgt_table]
+                entry["processes"].add(proc)
 
     return [
         {
@@ -298,3 +332,77 @@ def get_flow_pairs(edges_df: pd.DataFrame) -> list[dict[str, Any]]:
         }
         for p in sorted(pairs.values(), key=lambda x: -x["edge_count"])
     ]
+
+
+def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None = None) -> dict[str, Any]:
+    """Builds a node/edge graph for visualizing lineage end-to-end: table
+    nodes and process nodes, connected by directed table->process ("input")
+    and process->table ("output") edges — the actual step-by-step path data
+    takes, not just an aggregated table-to-table summary (see get_flow_pairs
+    for that view).
+    """
+    proc_inputs, proc_outputs = _process_io(edges_df)
+
+    proc_meta: dict[str, dict] = {}
+    if processes_df is not None and "process_fqn" in processes_df.columns:
+        for row in processes_df.to_dict(orient="records"):
+            pf = row.get("process_fqn")
+            if pf:
+                proc_meta[str(pf)] = row
+
+    # Node ids are opaque sequential tokens ("n0", "n1", ...) rather than the
+    # raw FQN/table key — the real identifiers (full_name / process_fqn) can
+    # contain "/", ".", ":" which are unsafe to use as DOM/SVG element ids.
+    table_ids: dict[str, str] = {}
+    process_ids: dict[str, str] = {}
+    nodes: list[dict] = []
+    counter = 0
+
+    def get_table_id(key: str) -> str:
+        nonlocal counter
+        if key not in table_ids:
+            table_ids[key] = f"n{counter}"
+            counter += 1
+            parts = key.split(".")
+            nodes.append({
+                "id": table_ids[key],
+                "type": "table",
+                "full_name": key,
+                "label": parts[-1] if parts else key,
+            })
+        return table_ids[key]
+
+    def get_process_id(proc: str) -> str:
+        nonlocal counter
+        if proc not in process_ids:
+            process_ids[proc] = f"n{counter}"
+            counter += 1
+            meta = proc_meta.get(proc, {})
+            nodes.append({
+                "id": process_ids[proc],
+                "type": "process",
+                "process_fqn": proc,
+                "label": meta.get("process_name") or proc.rsplit("/", 1)[-1][:12],
+                "query_type": meta.get("query_type"),
+                "process_code": meta.get("process_code"),
+            })
+        return process_ids[proc]
+
+    edges: list[dict] = []
+    seen_edges: set[tuple] = set()
+
+    def add_edge(source: str, target: str, kind: str) -> None:
+        k = (source, target, kind)
+        if k in seen_edges:
+            return
+        seen_edges.add(k)
+        edges.append({"source": source, "target": target, "kind": kind})
+
+    for proc in set(proc_inputs) | set(proc_outputs):
+        proc_id = get_process_id(proc)
+        for tbl in set(proc_inputs.get(proc, [])):
+            add_edge(get_table_id(tbl), proc_id, "input")
+        for tbl in set(proc_outputs.get(proc, [])):
+            add_edge(proc_id, get_table_id(tbl), "output")
+
+    return {"nodes": nodes, "edges": edges}

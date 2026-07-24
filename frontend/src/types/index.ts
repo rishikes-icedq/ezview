@@ -124,11 +124,44 @@ export interface ProcessRecord {
   last_seen_at: string
 }
 
-export interface FlowPair {
-  source_table: string
-  target_table: string
-  edge_count: number
-  process_count: number
+export interface LineageGraphNode {
+  id: string
+  type: 'table' | 'process'
+  label: string
+  full_name?: string
+  process_fqn?: string
+  query_type?: string | null
+  process_code?: string | null
+}
+
+export interface LineageGraphEdge {
+  source: string
+  target: string
+  kind: 'input' | 'output'
+}
+
+export interface LineageGraph {
+  nodes: LineageGraphNode[]
+  edges: LineageGraphEdge[]
+}
+
+export interface Snippet {
+  id: string
+  title: string
+  content: string
+}
+
+export interface SnippetGroup {
+  id: string
+  title: string
+  snippets: Snippet[]
+}
+
+export interface SnippetCollection {
+  id: string
+  title: string
+  groups: SnippetGroup[]
+  snippets: Snippet[]
 }
 
 export type ViewMode =

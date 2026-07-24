@@ -9,6 +9,7 @@ from services.analysis_svc import (
     compute_summary,
     get_edge_page,
     get_flow_pairs,
+    get_lineage_graph,
     parse_fqn,
 )
 from tests.conftest import EDGES_ROWS, PROCESSES_ROWS
@@ -226,6 +227,89 @@ def test_flow_pairs_count():
     assert pairs[0]["edge_count"] >= 1
 
 
+def test_flow_pairs_process_mediated_schema():
+    # Some pipelines split direct column->column flow into a "read_by"
+    # column->process edge plus a "writes_to" process->column edge (no
+    # direct column-to-column edge at all) instead of encoding "writes_to"
+    # as a direct copy. get_flow_pairs must still surface table->table flow
+    # by joining on process_fqn, not by assuming edge=="writes_to" rows are
+    # already table-to-table.
+    rows = [
+        {
+            "edge": "read_by",
+            "source_fqn": "/sys1/db1/schema1/stg_table/col1",
+            "source_type": "column",
+            "target_fqn": "/sys1/dataprocess/proc1",
+            "target_type": "dataprocess",
+            "process_fqn": "/sys1/dataprocess/proc1",
+        },
+        {
+            "edge": "writes_to",
+            "source_fqn": "/sys1/dataprocess/proc1",
+            "source_type": "dataprocess",
+            "target_fqn": "/sys1/db1/schema1/final_table/col2",
+            "target_type": "column",
+            "process_fqn": "/sys1/dataprocess/proc1",
+        },
+    ]
+    df = pd.DataFrame(rows)
+    pairs = get_flow_pairs(df)
+    assert len(pairs) == 1
+    assert pairs[0]["source_table"] == "db1.schema1.stg_table"
+    assert pairs[0]["target_table"] == "db1.schema1.final_table"
+    assert pairs[0]["process_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# get_lineage_graph
+# ---------------------------------------------------------------------------
+
+def test_lineage_graph_structure():
+    edges_df = pd.DataFrame(EDGES_ROWS)
+    processes_df = pd.DataFrame(PROCESSES_ROWS)
+    graph = get_lineage_graph(edges_df, processes_df)
+
+    # Node ids are opaque ("n0", "n1", ...) — assert on the real identifiers
+    # (full_name / process_fqn) and every id is unique and unsafe-char-free.
+    node_ids = [n["id"] for n in graph["nodes"]]
+    assert len(node_ids) == len(set(node_ids))
+    assert all(all(c.isalnum() or c == "_" for c in nid) for nid in node_ids)
+
+    def id_for(**match):
+        return next(n["id"] for n in graph["nodes"] if all(n.get(k) == v for k, v in match.items()))
+
+    table_a = id_for(type="table", full_name="db1.schema1.table_a")
+    table_b = id_for(type="table", full_name="db1.schema1.table_b")
+    table_c = id_for(type="table", full_name="db2.schema2.table_c")
+    proc_abc = id_for(type="process", process_fqn="/sys1/dataprocess/abc")
+    proc_def = id_for(type="process", process_fqn="/sys1/dataprocess/def")
+
+    edge_tuples = {(e["source"], e["target"], e["kind"]) for e in graph["edges"]}
+    assert (table_a, proc_abc, "input") in edge_tuples
+    assert (proc_abc, table_b, "output") in edge_tuples
+    assert (table_c, proc_def, "input") in edge_tuples
+    assert (proc_def, table_b, "output") in edge_tuples
+    # e1 and e2 both put table_a -> abc, deduped into a single edge
+    assert len(graph["edges"]) == 4
+
+
+def test_lineage_graph_process_node_uses_process_name():
+    edges_df = pd.DataFrame(EDGES_ROWS)
+    processes_df = pd.DataFrame(PROCESSES_ROWS)
+    graph = get_lineage_graph(edges_df, processes_df)
+    proc_node = next(n for n in graph["nodes"] if n.get("process_fqn") == "/sys1/dataprocess/abc")
+    assert proc_node["label"] == "INSERT into db1.schema1.table_b"
+    assert proc_node["query_type"] == "INSERT"
+    assert proc_node["process_code"] == "INSERT INTO table_b SELECT col1 FROM table_a"
+
+
+def test_lineage_graph_without_processes_df_falls_back_to_short_id():
+    edges_df = pd.DataFrame(EDGES_ROWS)
+    graph = get_lineage_graph(edges_df, None)
+    proc_node = next(n for n in graph["nodes"] if n.get("process_fqn") == "/sys1/dataprocess/abc")
+    assert proc_node["label"] == "abc"
+
+
 # ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
@@ -261,6 +345,14 @@ def test_lineage_flow_api(client, lineage_folder):
     resp = client.get(f"/api/lineage/flow?folder={lineage_folder}")
     assert resp.status_code == 200
     assert isinstance(resp.json(), list)
+
+
+def test_lineage_graph_api(client, lineage_folder):
+    resp = client.get(f"/api/lineage/graph?folder={lineage_folder}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "nodes" in body and "edges" in body
+    assert len(body["nodes"]) > 0
 
 
 def test_lineage_no_bundle(client, tmp_path):

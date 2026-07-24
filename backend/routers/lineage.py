@@ -11,6 +11,7 @@ from services.analysis_svc import (
     compute_summary,
     get_edge_page,
     get_flow_pairs,
+    get_lineage_graph,
     get_processes,
 )
 from services.file_io import read_json
@@ -116,3 +117,9 @@ def processes(folder: str) -> list:
 def flow(folder: str) -> list:
     edges_df, _, _ = _load_bundle(folder)
     return get_flow_pairs(edges_df)
+
+
+@router.get("/graph")
+def graph(folder: str) -> dict:
+    edges_df, processes_df, _ = _load_bundle(folder)
+    return get_lineage_graph(edges_df, processes_df)
