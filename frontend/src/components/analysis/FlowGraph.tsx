@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ReactFlow, Background, Controls, MiniMap, MarkerType, Position, Handle, NodeToolbar,
+  useNodesState, useEdgesState,
   type Node, type Edge, type NodeProps,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
@@ -143,7 +144,7 @@ function layout(graph: LineageGraph): { nodes: Node[]; edges: Edge[] } {
       id: `e${i}`,
       source: e.source,
       target: e.target,
-      type: 'smoothstep',
+      type: 'default',
       animated: e.kind === 'output',
       markerEnd: { type: MarkerType.ArrowClosed, width: 18, height: 18, color },
       style: { stroke: color, strokeWidth: 2 },
@@ -160,6 +161,9 @@ export default function FlowGraph({ folder }: Props) {
   const [error, setError] = useState<string | null>(null)
   const { theme } = useTheme()
 
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([])
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
+
   useEffect(() => {
     setLoading(true)
     setError(null)
@@ -169,7 +173,14 @@ export default function FlowGraph({ folder }: Props) {
       .finally(() => setLoading(false))
   }, [folder])
 
-  const { nodes, edges } = useMemo(() => (graph ? layout(graph) : { nodes: [], edges: [] }), [graph])
+  // Re-lays-out (and drops any manual dragging) whenever the underlying graph data changes —
+  // manual node positions are session-only, not persisted, so this reset is intentional.
+  useEffect(() => {
+    if (!graph) return
+    const laid = layout(graph)
+    setNodes(laid.nodes)
+    setEdges(laid.edges)
+  }, [graph, setNodes, setEdges])
 
   if (loading) return <div className="flex items-center gap-2 text-slate-500 py-4"><Loader2 size={16} className="animate-spin" /> Loading…</div>
   if (error) return <div className="px-3 py-2 bg-red-50 dark:bg-red-900/40 border border-red-300 dark:border-red-700 text-red-700 dark:text-red-300 text-sm rounded">{error}</div>
@@ -180,6 +191,8 @@ export default function FlowGraph({ folder }: Props) {
       <ReactFlow
         nodes={nodes}
         edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
         nodeTypes={NODE_TYPES}
         colorMode={theme}
         fitView
