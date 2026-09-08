@@ -11,5 +11,8 @@ frontend/dist/
 .pytest_cache/
 .mypy_cache/
 
+# Desktop-launcher diagnostic log (see run-app.ps1)
+ezview-launch.log
+
 # Agent context file (local only — do not commit)
 CLAUDE.md

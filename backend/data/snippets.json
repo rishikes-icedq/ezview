@@ -31,6 +31,27 @@
           ]
         },
         {
+          "id": "3772c7fc-199f-4a35-b8c6-8da5456607e3",
+          "title": "Redshift Lineage",
+          "snippets": [
+            {
+              "id": "e3cf9efa-102b-4ab0-a6aa-49b7a03c6926",
+              "title": "Stage 1",
+              "content": "python scripts/run_stage1.py 'staged_output/redshift_run/queries.json' `\n  --source-platform redshift `\n  --extraction-start '2026-08-21T00:00:00+00:00' `\n  --extraction-end   '2026-08-26T00:00:00+00:00' `\n  --crawled-asset-dir 'staged_output/crawl-metadata/redshift/conn-bd4a1eee-0d88-54c6-8750-53c9ae3b7add/crawl-783b3b50-6357-58f5-ad67-88e76d11e1b9/20260818075508936'"
+            },
+            {
+              "id": "eff96fc1-50a4-46c1-b3b5-42d18f6bc724",
+              "title": "Stage 2",
+              "content": "python scripts/run_stage2.py 'staged_output/redshift_run/queries.json' 'staged_output/redshift_run/stage2/' `\n  --icedq-connection-id 'conn-bd4a1eee-0d88-54c6-8750-53c9ae3b7add' `\n  --icedq-workspace-id  'wksc-fdd3fa7d-07ab-5b7a-b039-4f8330bab135'"
+            },
+            {
+              "id": "6aa5b231-2d27-4d34-aaf0-16b269ea7cb8",
+              "title": "Stage 3",
+              "content": "python scripts/run_stage3.py 'staged_output/redshift_run/stage2' 'staged_output/redshift_run/lineage' `\n  --source-platform redshift `\n  --manifest-path   'staged_output/redshift_run/queries.json' `\n  --crawled-asset-dir 'staged_output/crawl-metadata/redshift/conn-bd4a1eee-0d88-54c6-8750-53c9ae3b7add/crawl-783b3b50-6357-58f5-ad67-88e76d11e1b9/20260818075508936' `\n  --system-name ygd728"
+            }
+          ]
+        },
+        {
           "id": "59119c40-6ef0-40d1-ba0b-e53e6b62f23f",
           "title": "GBQ Lineage",
           "snippets": [
@@ -80,6 +101,33 @@
               "id": "2988e40c-7eb0-447d-b94a-a6e94f011265",
               "title": ".env PROD",
               "content": "EXTRACTION_MODE=deterministic\nTEMPORAL_HOST=icedq-temporal-frontend.default.svc.cluster.local:7233\nTEMPORAL_NAMESPACE=default\nTEMPORAL_TASK_QUEUE=lineage.crawl.activity.queue\n\n## For testing\nTEMPORAL_HOST=192.168.100.90:7233"
+            }
+          ]
+        },
+        {
+          "id": "19b7ed59-f065-4099-9d2b-cd52e0ae3d2e",
+          "title": "OKF",
+          "snippets": [
+            {
+              "id": "bfedd4af-7107-4a7c-b779-d82fb951c0de",
+              "title": "Run Generate OKF Script",
+              "content": "# OKF bundle generation — v1 (for testing)\npython \"Docs\\plans\\okf\\gen_okf.py\"\n\n# OKF bundle generation — v2 (plan-aligned, preferred)\npython \"Docs\\plans\\okf\\gen_okf_v2.py\"\n"
+            },
+            {
+              "id": "073a0d17-0dd1-44d4-9493-5ba1f9abbde9",
+              "title": "Run Suggest Rules Script",
+              "content": "$env:PYTHONPATH = \"\"; python \"c:\\Users\\RishikeshShede\\OneDrive - Torana Inc\\Documents\\code\\data-lineage\\Docs\\plans\\okf\\okf_rule_suggester.py\""
+            }
+          ]
+        },
+        {
+          "id": "8a90fb57-be62-4505-88bd-6cb8c8139b25",
+          "title": "Connection IDs",
+          "snippets": [
+            {
+              "id": "fba6db6e-7e55-4fae-b5ad-5fa4f53d0209",
+              "title": "100.90 Instance",
+              "content": "Source\t\t|    Connection ID\n----------------------------------------------------------\nTeradata\t|    conn-1a96e765-7b97-597c-b50d-c02fcec8f9b2\nSQLServer\t|    conn-521a716e-7452-5d20-9019-aa19b3226548\nSnowflake\t|    conn-c61b3c8c-01b1-5a42-9767-6056683166a3\nBigQuery\t|    conn-cfa54cb5-4bb9-5929-bb7c-843dc7a8e5ec\nOracle\t\t|    conn-967a2fb8-b291-5f87-84dc-46142ddcbe72\nDatabricks\t|    conn-bd0420e9-150a-5a41-9451-5a9ba87c818b\nPostgreSQL\t|    conn-17c3033d-44a8-58c6-b2fe-4635900c0b35\nRedshift\t|    conn-bd4a1eee-0d88-54c6-8750-53c9ae3b7add\nAthena Glue |    conn-35f72dd6-a3ff-5401-b785-52c6275e0a63"
             }
           ]
         }
