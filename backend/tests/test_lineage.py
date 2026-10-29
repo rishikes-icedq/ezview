@@ -10,6 +10,7 @@ from services.analysis_svc import (
     get_edge_page,
     get_flow_pairs,
     get_lineage_graph,
+    get_mapping_graph,
     parse_fqn,
 )
 from tests.conftest import EDGES_ROWS, PROCESSES_ROWS
@@ -20,9 +21,10 @@ from tests.conftest import EDGES_ROWS, PROCESSES_ROWS
 # ---------------------------------------------------------------------------
 
 def test_parse_fqn_column():
-    r = parse_fqn("/sys/db/schema/table/col")
+    r = parse_fqn("/sys/platform/db/schema/table/col")
     assert r["type"] == "column"
     assert r["system"] == "sys"
+    assert r["platform"] == "platform"
     assert r["database"] == "db"
     assert r["schema"] == "schema"
     assert r["table"] == "table"
@@ -30,7 +32,7 @@ def test_parse_fqn_column():
 
 
 def test_parse_fqn_table():
-    r = parse_fqn("/sys/db/schema/table")
+    r = parse_fqn("/sys/platform/db/schema/table")
     assert r["type"] == "table"
     assert r["table"] == "table"
     assert "column" not in r
@@ -54,7 +56,7 @@ def test_parse_fqn_no_leading_slash():
 
 
 def test_parse_fqn_preserves_raw():
-    raw = "/sys/db/s/t/c"
+    raw = "/sys/platform/db/s/t/c"
     assert parse_fqn(raw)["raw"] == raw
 
 
@@ -237,7 +239,7 @@ def test_flow_pairs_process_mediated_schema():
     rows = [
         {
             "edge": "read_by",
-            "source_fqn": "/sys1/db1/schema1/stg_table/col1",
+            "source_fqn": "/sys1/platform1/db1/schema1/stg_table/col1",
             "source_type": "column",
             "target_fqn": "/sys1/dataprocess/proc1",
             "target_type": "dataprocess",
@@ -247,7 +249,7 @@ def test_flow_pairs_process_mediated_schema():
             "edge": "writes_to",
             "source_fqn": "/sys1/dataprocess/proc1",
             "source_type": "dataprocess",
-            "target_fqn": "/sys1/db1/schema1/final_table/col2",
+            "target_fqn": "/sys1/platform1/db1/schema1/final_table/col2",
             "target_type": "column",
             "process_fqn": "/sys1/dataprocess/proc1",
         },
@@ -310,6 +312,133 @@ def test_lineage_graph_without_processes_df_falls_back_to_short_id():
     assert proc_node["label"] == "abc"
 
 
+VIEW_ROWS = [
+    # p1 reads base_table and writes my_view (target tagged "view")
+    {
+        "edge": "read_by",
+        "source_fqn": "/sys1/platform1/db1/schema1/base_table/col1",
+        "source_type": "column",
+        "target_fqn": "/sys1/dataprocess/p1",
+        "target_type": "dataprocess",
+        "process_fqn": "/sys1/dataprocess/p1",
+    },
+    {
+        "edge": "writes_to",
+        "source_fqn": "/sys1/dataprocess/p1",
+        "source_type": "dataprocess",
+        "target_fqn": "/sys1/platform1/db1/schema1/my_view",
+        "target_type": "view",
+        "process_fqn": "/sys1/dataprocess/p1",
+    },
+    # p2 reads my_view (source tagged "view") and writes final_table
+    {
+        "edge": "read_by",
+        "source_fqn": "/sys1/platform1/db1/schema1/my_view",
+        "source_type": "view",
+        "target_fqn": "/sys1/dataprocess/p2",
+        "target_type": "dataprocess",
+        "process_fqn": "/sys1/dataprocess/p2",
+    },
+    {
+        "edge": "writes_to",
+        "source_fqn": "/sys1/dataprocess/p2",
+        "source_type": "dataprocess",
+        "target_fqn": "/sys1/platform1/db1/schema1/final_table",
+        "target_type": "table",
+        "process_fqn": "/sys1/dataprocess/p2",
+    },
+]
+
+
+def test_lineage_graph_marks_views():
+    # A view's FQN is the same depth as a table's, so only the edges' own
+    # source_type/target_type tag tells them apart — from either side of an edge.
+    graph = get_lineage_graph(pd.DataFrame(VIEW_ROWS), None)
+    is_view = {n["full_name"]: n["is_view"] for n in graph["nodes"] if n["type"] == "table"}
+    assert is_view == {
+        "db1.schema1.base_table": False,
+        "db1.schema1.my_view": True,
+        "db1.schema1.final_table": False,
+    }
+
+
+def test_lineage_graph_without_type_columns_has_no_views():
+    df = pd.DataFrame(VIEW_ROWS).drop(columns=["source_type", "target_type"])
+    graph = get_lineage_graph(df, None)
+    tables = [n for n in graph["nodes"] if n["type"] == "table"]
+    assert len(tables) == 3
+    assert not any(n["is_view"] for n in tables)
+
+
+# ---------------------------------------------------------------------------
+# get_mapping_graph
+# ---------------------------------------------------------------------------
+
+def _row(edge, source_fqn, target_fqn, source_type, target_type):
+    return {
+        "edge": edge,
+        "source_fqn": source_fqn,
+        "source_type": source_type,
+        "target_fqn": target_fqn,
+        "target_type": target_type,
+        "process_fqn": "/sys1/dataprocess/p1",
+    }
+
+
+T = "/sys1/platform1/db1/schema1"
+MAPPING_ROWS = [
+    # src_table -> my_view: a table-level row plus two column-level rows (one duplicated)
+    _row("maps_to", f"{T}/src_table", f"{T}/my_view", "table", "view"),
+    _row("maps_to", f"{T}/src_table/a", f"{T}/my_view/x", "column", "column"),
+    _row("maps_to", f"{T}/src_table/b", f"{T}/my_view/y", "column", "column"),
+    _row("maps_to", f"{T}/src_table/b", f"{T}/my_view/y", "column", "column"),
+    # my_view -> final_table: table-level row only
+    _row("maps_to", f"{T}/my_view", f"{T}/final_table", "view", "table"),
+    # other_src -> other_dst: column-level rows only (no table-level row)
+    _row("maps_to", f"{T}/other_src/c", f"{T}/other_dst/d", "column", "column"),
+    # a mapping within one table is not table-to-table lineage
+    _row("maps_to", f"{T}/src_table/a", f"{T}/src_table/b", "column", "column"),
+    # read/write edges and processes are not part of the data mapping
+    _row("read_by", f"{T}/src_table/a", "/sys1/dataprocess/p1", "column", "dataprocess"),
+    _row("writes_to", "/sys1/dataprocess/p1", f"{T}/my_view/x", "dataprocess", "column"),
+]
+
+
+def test_mapping_graph_links_tables_through_maps_to_only():
+    graph = get_mapping_graph(pd.DataFrame(MAPPING_ROWS))
+    name = {n["id"]: n["full_name"] for n in graph["nodes"]}
+    links = {(name[e["source"]], name[e["target"]]): e["column_count"] for e in graph["edges"]}
+    assert links == {
+        ("db1.schema1.src_table", "db1.schema1.my_view"): 2,   # distinct column pairs, duplicate counted once
+        ("db1.schema1.my_view", "db1.schema1.final_table"): 0,  # table-level row only
+        ("db1.schema1.other_src", "db1.schema1.other_dst"): 1,  # column-level rows only
+    }
+    assert all(e["kind"] == "mapping" for e in graph["edges"])
+    # no process nodes, and the same-table mapping did not create a node or self-loop
+    assert all(n["type"] == "table" for n in graph["nodes"])
+    assert not any(e["source"] == e["target"] for e in graph["edges"])
+
+
+def test_mapping_graph_marks_views_and_has_unique_safe_ids():
+    graph = get_mapping_graph(pd.DataFrame(MAPPING_ROWS))
+    is_view = {n["full_name"]: n["is_view"] for n in graph["nodes"]}
+    assert is_view["db1.schema1.my_view"] is True
+    assert is_view["db1.schema1.src_table"] is False
+    ids = [n["id"] for n in graph["nodes"]]
+    assert len(ids) == len(set(ids))
+    assert all(all(c.isalnum() or c == "_" for c in i) for i in ids)
+
+
+def test_mapping_graph_without_maps_to_edges_is_empty():
+    rows = [r for r in MAPPING_ROWS if r["edge"] != "maps_to"]
+    assert get_mapping_graph(pd.DataFrame(rows)) == {"nodes": [], "edges": []}
+
+
+def test_mapping_graph_without_edge_column_is_empty():
+    df = pd.DataFrame(MAPPING_ROWS).drop(columns=["edge"])
+    assert get_mapping_graph(df) == {"nodes": [], "edges": []}
+
+
 # ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
@@ -353,6 +482,28 @@ def test_lineage_graph_api(client, lineage_folder):
     body = resp.json()
     assert "nodes" in body and "edges" in body
     assert len(body["nodes"]) > 0
+
+
+def test_lineage_graph_api_defaults_to_all_mode(client, lineage_folder):
+    default = client.get(f"/api/lineage/graph?folder={lineage_folder}").json()
+    explicit = client.get(f"/api/lineage/graph?folder={lineage_folder}&mode=all").json()
+    assert default == explicit
+    assert any(n["type"] == "process" for n in default["nodes"])
+
+
+def test_lineage_graph_api_mapping_mode(client, lineage_folder):
+    # The fixture bundle has only read/write edges, so its data-mapping graph is empty —
+    # but the mode must be honoured (no process nodes) rather than falling back to "all".
+    resp = client.get(f"/api/lineage/graph?folder={lineage_folder}&mode=mapping")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert not any(n["type"] == "process" for n in body["nodes"])
+    assert all(e["kind"] == "mapping" for e in body["edges"])
+
+
+def test_lineage_graph_api_rejects_unknown_mode(client, lineage_folder):
+    resp = client.get(f"/api/lineage/graph?folder={lineage_folder}&mode=bogus")
+    assert resp.status_code == 422
 
 
 def test_lineage_no_bundle(client, tmp_path):

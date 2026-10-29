@@ -1,5 +1,5 @@
 import api from './client'
-import type { LineageSummary, AssetDatabase, EdgePage, ProcessRecord, LineageGraph, LineageBundle, SortDirection } from '../types'
+import type { LineageSummary, AssetDatabase, EdgePage, ProcessRecord, LineageGraph, GraphMode, LineageBundle, SortDirection } from '../types'
 
 export const detectBundle = (path: string) =>
   api.get<LineageBundle>('/lineage/detect', { params: { path } }).then(r => r.data)
@@ -27,5 +27,5 @@ export const getEdges = (folder: string, params: {
 export const getProcesses = (folder: string) =>
   api.get<ProcessRecord[]>('/lineage/processes', { params: { folder } }).then(r => r.data)
 
-export const getGraph = (folder: string) =>
-  api.get<LineageGraph>('/lineage/graph', { params: { folder } }).then(r => r.data)
+export const getGraph = (folder: string, mode: GraphMode = 'all') =>
+  api.get<LineageGraph>('/lineage/graph', { params: { folder, mode } }).then(r => r.data)

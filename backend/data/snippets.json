@@ -11,12 +11,12 @@
             {
               "id": "s1",
               "title": "Stage 1",
-              "content": "python scripts/run_stage1.py staged_output/snowflake/queries.json `\n  --source-platform snowflake `\n  --extraction-start 2026-07-14T00:00:00+00:00 `\n  --extraction-end   2026-07-15T00:00:00+00:00"
+              "content": "python scripts/run_stage1.py staged_output/snowflake/queries.json `\n  --source-platform snowflake `\n  --extraction-start 2026-09-08T00:00:00+00:00 `\n  --extraction-end   2026-09-09T00:00:00+00:00"
             },
             {
               "id": "s2",
               "title": "Stage 2",
-              "content": "python scripts/run_stage2.py staged_output/snowflake/queries.json staged_output/snowflake/stage2 `\n  --icedq-workspace-id  wksc-60e00eb8-2cbd-5136-bc8a-793c9c633856 `\n  --icedq-connection-id conn-6cb6c49f-7231-5323-9190-82d8a6998afb"
+              "content": "python scripts/run_stage2.py staged_output/snowflake/queries.json staged_output/snowflake/stage2 `\n  --icedq-workspace-id wksc-fdd3fa7d-07ab-5b7a-b039-4f8330bab135 `\n  --icedq-connection-id conn-c61b3c8c-01b1-5a42-9767-6056683166a3"
             },
             {
               "id": "s3",
@@ -58,12 +58,12 @@
             {
               "id": "63c7a77a-38d6-4548-a8c8-d4555ed68a77",
               "title": "Stage 1",
-              "content": "python scripts/run_stage1.py staged_output/gbq/queries.json `\n  --source-platform bigquery `\n  --extraction-start 2026-06-01T00:00:00+00:00 `\n  --extraction-end   2026-07-07T00:00:00+00:00"
+              "content": "python scripts/run_stage1.py staged_output/gbq/queries.json `\n  --source-platform bigquery `\n  --extraction-start 2026-09-08T00:00:00+00:00 `\n  --extraction-end   2026-09-09T00:00:00+00:00"
             },
             {
               "id": "2525fae1-9b84-434a-b96f-3dad38f3ad83",
               "title": "Stage 2",
-              "content": "python scripts/run_stage2.py staged_output/gbq/queries.json staged_output/gbq/stage2 `\n  --icedq-workspace-id=wksc-60e00eb8-2cbd-5136-bc8a-793c9c633856 `\n  --icedq-connection-id=conn-f5b29b15-b7bf-5818-97e3-51f383fad375"
+              "content": "python scripts/run_stage2.py staged_output/gbq/queries.json staged_output/gbq/stage2 `\n  --icedq-workspace-id wksc-fdd3fa7d-07ab-5b7a-b039-4f8330bab135 `\n  --icedq-connection-id conn-cfa54cb5-4bb9-5929-bb7c-843dc7a8e5ec"
             },
             {
               "id": "1e42b072-4990-419c-99b5-6570cfc5f5b6",

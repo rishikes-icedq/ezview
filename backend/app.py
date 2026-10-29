@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from utils.logging_config import setup_logging
-from routers import browser, json_files, lineage, markdown, parquet, snippets
+from routers import browser, json_files, lineage, markdown, okf, parquet, snippets
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ app.include_router(json_files.router, prefix="/api/json", tags=["json"])
 app.include_router(markdown.router, prefix="/api/markdown", tags=["markdown"])
 app.include_router(lineage.router, prefix="/api/lineage", tags=["lineage"])
 app.include_router(snippets.router, prefix="/api/snippets", tags=["snippets"])
+app.include_router(okf.router, prefix="/api/okf", tags=["okf"])
 
 
 @app.get("/api/health")

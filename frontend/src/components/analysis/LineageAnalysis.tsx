@@ -1,21 +1,24 @@
 import { useState, useEffect } from 'react'
-import { Loader2, BarChart3, Database, GitBranch, Cpu, Network } from 'lucide-react'
+import { Loader2, BarChart3, Database, GitBranch, Cpu, Network, FolderTree } from 'lucide-react'
 import { getSummary } from '../../api/lineage'
-import type { LineageSummary } from '../../types'
+import type { GraphMode, LineageSummary } from '../../types'
+import type { FocusScope } from '../../utils/lineageFocus'
 import SummaryCards from './SummaryCards'
 import AssetTree from './AssetTree'
 import EdgeTable from './EdgeTable'
 import ProcessList from './ProcessList'
 import FlowGraph from './FlowGraph'
+import OkfCatalog from './OkfCatalog'
 
-type Tab = 'summary' | 'assets' | 'edges' | 'processes' | 'flow'
+type Tab = 'summary' | 'assets' | 'edges' | 'processes' | 'flow' | 'catalog'
 
 const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: 'summary',   label: 'Summary',    icon: <BarChart3 size={14} /> },
   { id: 'assets',    label: 'Assets',     icon: <Database size={14} /> },
   { id: 'edges',     label: 'Edges',      icon: <GitBranch size={14} /> },
   { id: 'processes', label: 'Processes',  icon: <Cpu size={14} /> },
-  { id: 'flow',      label: 'Data Flow',  icon: <Network size={14} /> },
+  { id: 'flow',      label: 'Lineage',    icon: <Network size={14} /> },
+  { id: 'catalog',   label: 'Catalog',    icon: <FolderTree size={14} /> },
 ]
 
 interface Props {
@@ -29,10 +32,21 @@ export default function LineageAnalysis({ folder, label }: Props) {
   const [tab, setTab] = useState<Tab>('summary')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // `database.schema.table` the Lineage tab is narrowed to, or null for the whole graph.
+  const [focusTable, setFocusTable] = useState<string | null>(null)
+  // Preferences, so unlike focusTable they survive switching folders.
+  const [focusScope, setFocusScope] = useState<FocusScope>('full')
+  const [graphMode, setGraphMode] = useState<GraphMode>('all')
+
+  const viewLineage = (fullName: string) => {
+    setFocusTable(fullName)
+    setTab('flow')
+  }
 
   useEffect(() => {
     setLoading(true)
     setError(null)
+    setFocusTable(null)
     getSummary(folder)
       .then(setSummary)
       .catch(e => setError(e.message))
@@ -84,10 +98,11 @@ export default function LineageAnalysis({ folder, label }: Props) {
         ) : summary ? (
           <>
             {tab === 'summary'   && <SummaryCards summary={summary} />}
-            {tab === 'assets'    && <AssetTree folder={folder} />}
+            {tab === 'assets'    && <AssetTree folder={folder} onViewLineage={viewLineage} />}
             {tab === 'edges'     && <EdgeTable folder={folder} />}
             {tab === 'processes' && <ProcessList folder={folder} />}
-            {tab === 'flow'      && <FlowGraph folder={folder} />}
+            {tab === 'flow'      && <FlowGraph folder={folder} focusTable={focusTable} onFocusChange={setFocusTable} focusScope={focusScope} onScopeChange={setFocusScope} graphMode={graphMode} onGraphModeChange={setGraphMode} />}
+            {tab === 'catalog'   && <OkfCatalog folder={folder} />}
           </>
         ) : null}
       </div>

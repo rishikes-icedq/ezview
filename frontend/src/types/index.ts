@@ -129,6 +129,8 @@ export interface LineageGraphNode {
   type: 'table' | 'process'
   label: string
   full_name?: string
+  /** Table nodes only: the pipeline tags this object as a view rather than a table. */
+  is_view?: boolean
   process_fqn?: string
   query_type?: string | null
   process_code?: string | null
@@ -137,8 +139,14 @@ export interface LineageGraphNode {
 export interface LineageGraphEdge {
   source: string
   target: string
-  kind: 'input' | 'output'
+  /** input = table→process (read), output = process→table (write), mapping = table/view→table/view via maps_to. */
+  kind: 'input' | 'output' | 'mapping'
+  /** Mapping edges only: how many column-to-column mappings back this link (0 = a table-level link only). */
+  column_count?: number
 }
+
+/** `all` = tables, views and the processes between them; `mapping` = only table/view → table/view links from maps_to edges. */
+export type GraphMode = 'all' | 'mapping'
 
 export interface LineageGraph {
   nodes: LineageGraphNode[]
@@ -162,6 +170,106 @@ export interface SnippetCollection {
   title: string
   groups: SnippetGroup[]
   snippets: Snippet[]
+}
+
+export interface OkfSummary {
+  databases: number
+  schemas: number
+  tables: number
+  views: number
+  columns: number
+}
+
+export interface OkfAssetRef {
+  name: string
+  type: 'table' | 'view'
+  status: string
+  tags: string[]
+  column_count: number
+  path: string
+}
+
+export interface OkfSchemaNode {
+  schema: string
+  owner?: string | null
+  assets: OkfAssetRef[]
+}
+
+export interface OkfDatabaseNode {
+  database: string
+  schemas: OkfSchemaNode[]
+}
+
+export interface OkfReviewQueue {
+  blocked: string[]
+  events: string[]
+}
+
+export interface OkfHistoryEntry {
+  date: string
+  kind: string
+  summary: string
+  details: string[]
+}
+
+export interface OkfCatalog {
+  found: boolean
+  connection_id?: string
+  generated_at?: string
+  summary?: OkfSummary
+  databases?: OkfDatabaseNode[]
+  review_queue?: OkfReviewQueue
+  history?: OkfHistoryEntry[]
+}
+
+export interface OkfAssetLink {
+  name: string
+  path: string
+}
+
+export interface OkfColumnRef {
+  asset: string
+  column: string
+  path: string
+  confidence?: string
+}
+
+export interface OkfColumnDetail {
+  name: string
+  type: string
+  transform?: string | null
+  expression?: string | null
+  sources: OkfColumnRef[]
+  used_in: OkfColumnRef[]
+}
+
+export interface OkfProcessBlock {
+  query_type: string
+  process_id: string
+  last_seen: string
+  sql: string
+}
+
+export interface OkfAssetDetail {
+  name: string
+  type: 'table' | 'view'
+  status: string
+  description?: string | null
+  owner?: string | null
+  tags: string[]
+  created_at?: string | null
+  fqn: string
+  database: string
+  schema: string
+  column_count: number
+  upstream: OkfAssetLink[]
+  downstream: OkfAssetLink[]
+  columns: OkfColumnDetail[]
+  primary_key?: string | null
+  written_by: OkfProcessBlock[]
+  read_by: OkfProcessBlock[]
+  business_context?: string | null
+  data_quality?: string | null
 }
 
 export type ViewMode =

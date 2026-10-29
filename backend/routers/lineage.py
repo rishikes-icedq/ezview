@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 
@@ -12,6 +12,7 @@ from services.analysis_svc import (
     get_edge_page,
     get_flow_pairs,
     get_lineage_graph,
+    get_mapping_graph,
     get_processes,
 )
 from services.file_io import read_json
@@ -120,6 +121,8 @@ def flow(folder: str) -> list:
 
 
 @router.get("/graph")
-def graph(folder: str) -> dict:
+def graph(folder: str, mode: Literal["all", "mapping"] = "all") -> dict:
     edges_df, processes_df, _ = _load_bundle(folder)
+    if mode == "mapping":
+        return get_mapping_graph(edges_df)
     return get_lineage_graph(edges_df, processes_df)

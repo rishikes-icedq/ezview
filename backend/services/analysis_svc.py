@@ -39,17 +39,20 @@ def parse_fqn(fqn: str) -> dict[str, Any]:
             "raw": s,
         }
 
+    # The pipeline inserts an explicit platform segment right after the
+    # system name: /system/platform/database/schema/table[/column] — one
+    # level deeper than a bare /system/database/schema/table[/column].
+    if len(rest) == 5:
+        return {"type": "column", "system": system, "platform": rest[0], "database": rest[1],
+                "schema": rest[2], "table": rest[3], "column": rest[4], "raw": s}
     if len(rest) == 4:
-        return {"type": "column", "system": system, "database": rest[0],
-                "schema": rest[1], "table": rest[2], "column": rest[3], "raw": s}
+        return {"type": "table", "system": system, "platform": rest[0], "database": rest[1],
+                "schema": rest[2], "table": rest[3], "raw": s}
     if len(rest) == 3:
-        return {"type": "table", "system": system, "database": rest[0],
-                "schema": rest[1], "table": rest[2], "raw": s}
+        return {"type": "schema", "system": system, "platform": rest[0], "database": rest[1],
+                "schema": rest[2], "raw": s}
     if len(rest) == 2:
-        return {"type": "schema", "system": system, "database": rest[0],
-                "schema": rest[1], "raw": s}
-    if len(rest) == 1:
-        return {"type": "database", "system": system, "database": rest[0], "raw": s}
+        return {"type": "database", "system": system, "platform": rest[0], "database": rest[1], "raw": s}
 
     return {"type": "unresolved", "raw": s}
 
@@ -300,6 +303,23 @@ def _process_io(edges_df: pd.DataFrame) -> tuple[dict[str, list[str]], dict[str,
     return proc_inputs, proc_outputs
 
 
+def _view_table_keys(edges_df: pd.DataFrame) -> set[str]:
+    """Table keys (see _table_key) the pipeline tags as views. A view's FQN is
+    the same depth as a table's, so parse_fqn can't tell them apart — the edges'
+    own source_type/target_type columns ("view" vs "table") are the only signal.
+    """
+    keys: set[str] = set()
+    for fqn_col, type_col in (("source_fqn", "source_type"), ("target_fqn", "target_type")):
+        if fqn_col not in edges_df.columns or type_col not in edges_df.columns:
+            continue
+        tagged = edges_df.loc[edges_df[type_col].astype(str).str.lower() == "view", fqn_col].dropna()
+        for fqn in tagged.unique():
+            p = parse_fqn(str(fqn))
+            if p["type"] in ("column", "table"):
+                keys.add(_table_key(p))
+    return keys
+
+
 def get_flow_pairs(edges_df: pd.DataFrame) -> list[dict[str, Any]]:
     """Aggregates table-to-table data flow, derived through each process's
     inputs and outputs (see _process_io) rather than by filtering on a
@@ -334,6 +354,17 @@ def get_flow_pairs(edges_df: pd.DataFrame) -> list[dict[str, Any]]:
     ]
 
 
+def _table_node(node_id: str, key: str, view_keys: set[str]) -> dict[str, Any]:
+    parts = key.split(".")
+    return {
+        "id": node_id,
+        "type": "table",
+        "full_name": key,
+        "label": parts[-1] if parts else key,
+        "is_view": key in view_keys,
+    }
+
+
 def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None = None) -> dict[str, Any]:
     """Builds a node/edge graph for visualizing lineage end-to-end: table
     nodes and process nodes, connected by directed table->process ("input")
@@ -342,6 +373,7 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
     for that view).
     """
     proc_inputs, proc_outputs = _process_io(edges_df)
+    view_keys = _view_table_keys(edges_df)
 
     proc_meta: dict[str, dict] = {}
     if processes_df is not None and "process_fqn" in processes_df.columns:
@@ -363,13 +395,7 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
         if key not in table_ids:
             table_ids[key] = f"n{counter}"
             counter += 1
-            parts = key.split(".")
-            nodes.append({
-                "id": table_ids[key],
-                "type": "table",
-                "full_name": key,
-                "label": parts[-1] if parts else key,
-            })
+            nodes.append(_table_node(table_ids[key], key, view_keys))
         return table_ids[key]
 
     def get_process_id(proc: str) -> str:
@@ -405,4 +431,49 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
         for tbl in set(proc_outputs.get(proc, [])):
             add_edge(proc_id, get_table_id(tbl), "output")
 
+    return {"nodes": nodes, "edges": edges}
+
+
+def get_mapping_graph(edges_df: pd.DataFrame) -> dict[str, Any]:
+    """Builds the data-mapping graph: table/view nodes only, with one directed
+    "mapping" edge per (source table, target table) pair linked by `maps_to`
+    edges and no processes in between — "this table/view is populated from that
+    one", as opposed to get_lineage_graph's step-by-step read/write path.
+
+    `maps_to` rows come in two shapes: table->table rows (the table-level link)
+    and column->column rows (the column-level detail). A pair is linked if
+    either shape says so; `column_count` is how many distinct column mappings
+    the column-level rows give for it (0 if only the table-level row exists).
+    Mappings within a single table are dropped, as in get_flow_pairs.
+    """
+    if "edge" not in edges_df.columns:
+        return {"nodes": [], "edges": []}
+
+    mapped = edges_df[edges_df["edge"].astype(str).str.lower() == "maps_to"]
+    pair_columns: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for row in mapped[["source_fqn", "target_fqn"]].dropna().itertuples(index=False):
+        src, tgt = parse_fqn(str(row.source_fqn)), parse_fqn(str(row.target_fqn))
+        if src["type"] not in ("column", "table") or tgt["type"] not in ("column", "table"):
+            continue
+        src_key, tgt_key = _table_key(src), _table_key(tgt)
+        if src_key == tgt_key:
+            continue
+        columns = pair_columns.setdefault((src_key, tgt_key), set())
+        if src["type"] == "column" and tgt["type"] == "column":
+            columns.add((src["column"], tgt["column"]))
+
+    view_keys = _view_table_keys(edges_df)
+    table_ids: dict[str, str] = {}
+    nodes: list[dict] = []
+
+    def get_table_id(key: str) -> str:
+        if key not in table_ids:
+            table_ids[key] = f"n{len(table_ids)}"
+            nodes.append(_table_node(table_ids[key], key, view_keys))
+        return table_ids[key]
+
+    edges = [
+        {"source": get_table_id(src_key), "target": get_table_id(tgt_key), "kind": "mapping", "column_count": len(columns)}
+        for (src_key, tgt_key), columns in pair_columns.items()
+    ]
     return {"nodes": nodes, "edges": edges}

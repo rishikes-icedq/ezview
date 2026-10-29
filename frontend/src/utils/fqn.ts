@@ -2,6 +2,7 @@ export interface ParsedFqn {
   type: 'column' | 'table' | 'schema' | 'database' | 'dataprocess' | 'unresolved'
   raw: string
   system?: string
+  platform?: string
   database?: string
   schema?: string
   table?: string
@@ -23,17 +24,20 @@ export function parseFqn(fqn: string): ParsedFqn {
     return { type: 'dataprocess', system, process_id: rest[1] ?? '', raw: fqn }
   }
 
+  // The pipeline inserts an explicit platform segment right after the system
+  // name: /system/platform/database/schema/table[/column] — one level
+  // deeper than a bare /system/database/schema/table[/column].
+  if (rest.length === 5) {
+    return { type: 'column', system, platform: rest[0], database: rest[1], schema: rest[2], table: rest[3], column: rest[4], raw: fqn }
+  }
   if (rest.length === 4) {
-    return { type: 'column', system, database: rest[0], schema: rest[1], table: rest[2], column: rest[3], raw: fqn }
+    return { type: 'table', system, platform: rest[0], database: rest[1], schema: rest[2], table: rest[3], raw: fqn }
   }
   if (rest.length === 3) {
-    return { type: 'table', system, database: rest[0], schema: rest[1], table: rest[2], raw: fqn }
+    return { type: 'schema', system, platform: rest[0], database: rest[1], schema: rest[2], raw: fqn }
   }
   if (rest.length === 2) {
-    return { type: 'schema', system, database: rest[0], schema: rest[1], raw: fqn }
-  }
-  if (rest.length === 1) {
-    return { type: 'database', system, database: rest[0], raw: fqn }
+    return { type: 'database', system, platform: rest[0], database: rest[1], raw: fqn }
   }
 
   return { type: 'unresolved', raw: fqn }
@@ -44,6 +48,7 @@ export function parseFqn(fqn: string): ParsedFqn {
  * against a light/white background. */
 export const FQN_SEGMENT_COLORS = [
   'text-slate-600 dark:text-slate-400',    // system
+  'text-rose-600 dark:text-rose-400',      // platform
   'text-orange-600 dark:text-orange-400',  // database
   'text-green-700 dark:text-green-400',    // schema
   'text-cyan-700 dark:text-cyan-400',      // table
