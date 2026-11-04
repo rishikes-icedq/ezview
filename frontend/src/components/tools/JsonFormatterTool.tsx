@@ -1,31 +1,34 @@
 import { useState } from 'react'
-import { Braces, Copy, Check, Eraser, Wand2 } from 'lucide-react'
+import { Braces, Copy, Check, Eraser, Wand2, AlertTriangle } from 'lucide-react'
 import { JsonNode } from '../viewers/JsonNode'
-import { smartParseJson } from '../../utils/smartJsonParse'
+import { smartParseJson, type SmartParseResult } from '../../utils/smartJsonParse'
+
+type ParseNotes = Pick<SmartParseResult, 'unwrapped' | 'combined' | 'truncated'>
+const NO_NOTES: ParseNotes = { unwrapped: 0 }
 
 export default function JsonFormatterTool() {
   const [input, setInput] = useState('')
   const [value, setValue] = useState<unknown>(undefined)
   const [error, setError] = useState<string | null>(null)
-  const [unwrapped, setUnwrapped] = useState(0)
+  const [notes, setNotes] = useState<ParseNotes>(NO_NOTES)
   const [copied, setCopied] = useState(false)
 
   const format = (text: string) => {
     if (!text.trim()) {
       setValue(undefined)
       setError(null)
-      setUnwrapped(0)
+      setNotes(NO_NOTES)
       return
     }
     const result = smartParseJson(text)
     if ('error' in result && result.error) {
       setValue(undefined)
       setError(result.error)
-      setUnwrapped(0)
+      setNotes(NO_NOTES)
     } else {
       setValue(result.value)
       setError(null)
-      setUnwrapped(result.unwrapped)
+      setNotes({ unwrapped: result.unwrapped, combined: result.combined, truncated: result.truncated })
     }
   }
 
@@ -38,7 +41,7 @@ export default function JsonFormatterTool() {
     setInput('')
     setValue(undefined)
     setError(null)
-    setUnwrapped(0)
+    setNotes(NO_NOTES)
   }
 
   const copyFormatted = () => {
@@ -48,6 +51,8 @@ export default function JsonFormatterTool() {
   }
 
   const hasResult = value !== undefined
+  const { unwrapped, combined, truncated } = notes
+  const itemCount = Array.isArray(value) ? value.length : 1
 
   return (
     <div className="flex flex-col h-full">
@@ -78,7 +83,7 @@ export default function JsonFormatterTool() {
         {/* Input pane */}
         <div className="w-1/2 flex flex-col border-r border-slate-200 dark:border-slate-800 min-h-0">
           <div className="px-3 py-1.5 text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800/60 shrink-0">
-            Paste JSON — plain or stringified/escaped
+            Paste JSON — an object, a list, or several comma-separated objects; plain or stringified/escaped
           </div>
           <textarea
             value={input}
@@ -91,10 +96,20 @@ export default function JsonFormatterTool() {
 
         {/* Output pane */}
         <div className="w-1/2 flex flex-col min-h-0">
-          <div className="px-3 py-1.5 text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800/60 shrink-0 flex items-center gap-1.5">
+          <div className="px-3 py-1.5 text-xs text-slate-500 border-b border-slate-200 dark:border-slate-800/60 shrink-0 flex flex-wrap items-center gap-x-4 gap-y-1">
             {unwrapped > 0 && hasResult && (
               <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400">
                 <Wand2 size={11} /> unwrapped {unwrapped} layer{unwrapped !== 1 ? 's' : ''} of stringified JSON
+              </span>
+            )}
+            {combined !== undefined && hasResult && (
+              <span className="flex items-center gap-1 text-indigo-600 dark:text-indigo-400">
+                <Wand2 size={11} /> combined {combined} separate values into a list
+              </span>
+            )}
+            {truncated && hasResult && (
+              <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400">
+                <AlertTriangle size={11} /> input is cut off — showing the {itemCount} complete item{itemCount !== 1 ? 's' : ''}, the unfinished one was dropped
               </span>
             )}
             {!hasResult && !error && <span>Formatted result</span>}

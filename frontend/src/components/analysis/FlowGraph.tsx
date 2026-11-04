@@ -1,17 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ReactFlow, Background, Controls, MiniMap, MarkerType, Position, Handle, NodeToolbar, Panel,
+  ReactFlow, Background, Controls, MiniMap, Position, Handle, NodeToolbar, Panel,
   useNodesState, useEdgesState,
-  type Node, type Edge, type NodeProps,
+  type Node, type Edge, type NodeProps, type ReactFlowInstance,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import dagre from '@dagrejs/dagre'
-import { Loader2, Table2, Layers, Cpu, Crosshair, RotateCcw, MousePointerClick } from 'lucide-react'
+import { Loader2, Table2, Layers, Cpu, Boxes, ChevronDown, ChevronUp, Crosshair, RotateCcw, MousePointerClick } from 'lucide-react'
 import { toast } from 'sonner'
 import { getGraph } from '../../api/lineage'
 import { useTheme } from '../../contexts/ThemeContext'
-import { focusLineage, edgeKey, type FocusScope } from '../../utils/lineageFocus'
-import type { GraphMode, LineageGraph, LineageGraphEdge } from '../../types'
+import { focusLineage, type FocusScope } from '../../utils/lineageFocus'
+import { layoutLineage, EDGE_COLOR, TABLE_WIDTH, TABLE_HEIGHT, PROCESS_WIDTH, PROCESS_HEIGHT, SP_HEADER_HEIGHT } from './flowLayout'
+import type { GraphMode, LineageGraph } from '../../types'
 
 interface Props {
   folder: string
@@ -25,7 +25,7 @@ interface Props {
 }
 
 const MODE_OPTIONS: { id: GraphMode; label: string; hint: string }[] = [
-  { id: 'all', label: 'All', hint: 'Tables and views together with the processes that read and write them.' },
+  { id: 'all', label: 'All', hint: 'Tables and views together with the processes that read and write them. Processes run by a stored procedure sit inside its yellow box (click the arrow to open it); a procedure that calls another is linked to it (yellow). A view has no process, so it is linked straight to what it maps from (pink).' },
   { id: 'mapping', label: 'Data Mapping', hint: 'Only table/view → table/view links from maps_to edges, with no processes in between. Edge labels show how many columns are mapped.' },
 ]
 
@@ -83,22 +83,6 @@ function Segmented<T extends string>({ ariaLabel, options, value, onChange, tone
   )
 }
 
-// How faded items are when shown for context but not directly upstream/downstream of the focused table.
-const DIMMED_OPACITY = 0.35
-
-const TABLE_WIDTH = 200
-const TABLE_HEIGHT = 44
-const PROCESS_WIDTH = 100
-const PROCESS_HEIGHT = 36
-
-// Matches the read/write arrow convention already used in AssetTree.tsx
-// (emerald ArrowUpRight = read, indigo ArrowDownLeft = write).
-const EDGE_COLOR: Record<LineageGraphEdge['kind'], string> = {
-  input: '#10b981',
-  output: '#6366f1',
-  mapping: '#f97316',
-}
-
 // Same query-type hues as queryTypeBadge() in utils/format.ts, adapted for a
 // filled graph node rather than a text badge.
 const QUERY_TYPE_NODE_COLOR: Record<string, string> = {
@@ -113,6 +97,8 @@ const DEFAULT_PROCESS_COLOR = 'bg-slate-100 border-slate-400 text-slate-800 dark
 
 const TABLE_NODE_COLOR = 'bg-cyan-100 border-cyan-400 text-cyan-900 dark:bg-cyan-900/50 dark:border-cyan-600 dark:text-cyan-100'
 const VIEW_NODE_COLOR = 'bg-fuchsia-100 border-fuchsia-400 text-fuchsia-900 dark:bg-fuchsia-900/50 dark:border-fuchsia-600 dark:text-fuchsia-100'
+// Same hue as EDGE_COLOR.calls. Translucent so the edges that pass behind an expanded box stay visible.
+const STORED_PROCEDURE_COLOR = 'bg-yellow-100/80 border-yellow-500 text-yellow-900 dark:bg-yellow-900/30 dark:border-yellow-600 dark:text-yellow-100'
 
 function TableNode({ data }: NodeProps<Node<{ label: string; fullName?: string; focused?: boolean; isView?: boolean }>>) {
   const kind = data.isView ? 'View' : 'Table'
@@ -130,7 +116,7 @@ function TableNode({ data }: NodeProps<Node<{ label: string; fullName?: string; 
   )
 }
 
-function ProcessNode({ data }: NodeProps<Node<{ queryType?: string | null; processCode?: string | null; processFqn?: string }>>) {
+function ProcessNode({ data }: NodeProps<Node<{ label: string; queryType?: string | null; processCode?: string | null; processFqn?: string }>>) {
   const colorClass = (data.queryType && QUERY_TYPE_NODE_COLOR[data.queryType.toUpperCase()]) ?? DEFAULT_PROCESS_COLOR
   const [hovered, setHovered] = useState(false)
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -177,117 +163,80 @@ function ProcessNode({ data }: NodeProps<Node<{ queryType?: string | null; proce
       >
         <Handle type="target" position={Position.Left} />
         <Cpu size={13} className="shrink-0" />
-        <span className="text-[11px] font-semibold truncate">{data.queryType ?? '?'}</span>
+        <span className="text-[11px] font-semibold truncate">{data.label}</span>
         <Handle type="source" position={Position.Right} />
       </div>
     </>
   )
 }
 
-const NODE_TYPES = { table: TableNode, process: ProcessNode }
+/** Opens/closes a stored-procedure box. Given by GraphCanvas, which also keeps the box where it was on screen. */
+const ContainerToggleContext = createContext<(nodeId: string, fullName: string) => void>(() => {})
+
+// A stored procedure: a box named after it that holds the processes it ran. Collapsed it is just
+// the header row and the table edges of its processes attach to it; expanded, the processes are
+// drawn inside it (as separate nodes, see layoutLineage) and their edges attach to them. Its
+// `calls` edges attach to it either way, hence handles on the header row rather than mid-box.
+function StoredProcedureNode({ id, data }: NodeProps<Node<{ label: string; fqn?: string; fullName?: string; expanded: boolean; childCount: number; width: number; height: number }>>) {
+  const toggle = useContext(ContainerToggleContext)
+  const copyFqn = () => {
+    if (!data.fqn) return
+    navigator.clipboard.writeText(data.fqn)
+    toast.success('Copied stored procedure FQN to clipboard')
+  }
+  return (
+    <div
+      onClick={copyFqn}
+      title={`Stored procedure ${data.fullName ?? data.label}\nClick to copy its FQN`}
+      className={`rounded-lg border-2 shadow-sm cursor-pointer ${STORED_PROCEDURE_COLOR}`}
+      style={{ width: data.width, height: data.height }}
+    >
+      <Handle type="target" position={Position.Left} style={{ top: SP_HEADER_HEIGHT / 2 }} />
+      <div className="flex items-center gap-1.5 px-2.5" style={{ height: SP_HEADER_HEIGHT - 4 }}>
+        <Boxes size={14} className="shrink-0" />
+        <span className="flex-1 min-w-0 text-[11px] font-semibold truncate">{data.label}</span>
+        {data.childCount > 0 && (
+          <button
+            // `nodrag` keeps a press here from starting a node drag.
+            className="nodrag shrink-0 rounded p-0.5 hover:bg-yellow-300/60 dark:hover:bg-yellow-700/50 transition-colors"
+            aria-label={`${data.expanded ? 'Collapse' : 'Expand'} ${data.label}`}
+            aria-expanded={data.expanded}
+            title={data.expanded ? 'Collapse' : `Show the ${data.childCount === 1 ? 'process' : `${data.childCount} processes`} inside`}
+            onClick={e => {
+              e.stopPropagation()
+              if (data.fullName) toggle(id, data.fullName)
+            }}
+          >
+            {data.expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+          </button>
+        )}
+      </div>
+      <Handle type="source" position={Position.Right} style={{ top: SP_HEADER_HEIGHT / 2 }} />
+    </div>
+  )
+}
+
+const NODE_TYPES = { table: TableNode, process: ProcessNode, stored_procedure: StoredProcedureNode }
 
 const plural = (n: number, singular: string, pluralForm = `${singular}s`) => `${n} ${n === 1 ? singular : pluralForm}`
 
-/** Nodes/edges outside `path` are drawn faded; omit `path` to draw everything at full strength. */
-function layout(
-  graph: LineageGraph,
-  focusTable: string | null = null,
-  path?: { nodeIds: Set<string>; edgeKeys: Set<string> },
-): { nodes: Node[]; edges: Edge[] } {
-  const g = new dagre.graphlib.Graph()
-  g.setDefaultEdgeLabel(() => ({}))
-  g.setGraph({ rankdir: 'LR', nodesep: 24, ranksep: 90 })
-
-  for (const n of graph.nodes) {
-    const isTable = n.type === 'table'
-    g.setNode(n.id, { width: isTable ? TABLE_WIDTH : PROCESS_WIDTH, height: isTable ? TABLE_HEIGHT : PROCESS_HEIGHT })
-  }
-  for (const e of graph.edges) {
-    g.setEdge(e.source, e.target)
-  }
-  dagre.layout(g)
-
-  // The focused table is often one of very many inputs to a process (e.g. 1 of 148), and
-  // dagre can park it thousands of px above/below that process in the same column. Swap it
-  // with the dimmed sibling level with the process so the direct path reads in a straight
-  // line and can be framed at a readable zoom. Same-size nodes in one column, so no overlap.
-  if (path && focusTable) {
-    const focus = graph.nodes.find(n => n.type === 'table' && n.full_name === focusTable)
-    if (focus) {
-      const degree = new Map<string, number>()
-      for (const e of graph.edges) {
-        degree.set(e.source, (degree.get(e.source) ?? 0) + 1)
-        degree.set(e.target, (degree.get(e.target) ?? 0) + 1)
-      }
-      const hubId = graph.edges
-        .filter(e => path.edgeKeys.has(edgeKey(e)) && (e.source === focus.id || e.target === focus.id))
-        .map(e => (e.source === focus.id ? e.target : e.source))
-        .sort((a, b) => (degree.get(b) ?? 0) - (degree.get(a) ?? 0))[0]
-      const me = g.node(focus.id)
-      const hub = hubId ? g.node(hubId) : undefined
-      if (hub) {
-        let best: typeof me | null = null
-        for (const n of graph.nodes) {
-          if (n.type !== 'table' || path.nodeIds.has(n.id)) continue
-          const p = g.node(n.id)
-          if (Math.abs(p.x - me.x) > 1) continue
-          if (!best || Math.abs(p.y - hub.y) < Math.abs(best.y - hub.y)) best = p
-        }
-        if (best && Math.abs(best.y - hub.y) < Math.abs(me.y - hub.y)) [me.y, best.y] = [best.y, me.y]
-      }
-    }
-  }
-
-  const nodes: Node[] = graph.nodes.map(n => {
-    const pos = g.node(n.id)
-    const isTable = n.type === 'table'
-    return {
-      id: n.id,
-      type: n.type,
-      position: { x: pos.x - pos.width / 2, y: pos.y - pos.height / 2 },
-      data: isTable
-        ? { label: n.label, fullName: n.full_name, isView: n.is_view, focused: focusTable !== null && n.full_name === focusTable }
-        : { queryType: n.query_type, processCode: n.process_code, processFqn: n.process_fqn },
-      sourcePosition: Position.Right,
-      targetPosition: Position.Left,
-      ...(path && !path.nodeIds.has(n.id) && { style: { opacity: DIMMED_OPACITY } }),
-    }
-  })
-
-  const edges: Edge[] = graph.edges.map((e, i) => {
-    const color = EDGE_COLOR[e.kind]
-    const dimmed = !!path && !path.edgeKeys.has(edgeKey(e))
-    const isOutput = e.kind === 'output'
-    // Mapping edges say how many columns are mapped; skipped on dimmed ones to keep a big graph legible.
-    const label = e.kind === 'mapping' && e.column_count && !dimmed ? plural(e.column_count, 'col') : undefined
-    return {
-      id: `e${i}`,
-      source: e.source,
-      target: e.target,
-      type: 'default',
-      ...(label && { label }),
-      // Output edges are dashed via React Flow's `animated`. Dimmed ones keep the
-      // dashes but stand still, so a big graph isn't dozens of running animations.
-      animated: isOutput && !dimmed,
-      markerEnd: { type: MarkerType.ArrowClosed, width: 18, height: 18, color },
-      style: {
-        stroke: color,
-        strokeWidth: 2,
-        ...(dimmed && { opacity: DIMMED_OPACITY, ...(isOutput && { strokeDasharray: 5 }) }),
-      },
-      zIndex: 1,
-    }
-  })
-
-  return { nodes, edges }
-}
-
-function Legend({ hasViews, mode }: { hasViews: boolean; mode: GraphMode }) {
+function Legend({ hasViews, hasDirect, hasStoredProcedures, hasCalls, mode }: {
+  hasViews: boolean
+  hasDirect: boolean
+  hasStoredProcedures: boolean
+  hasCalls: boolean
+  mode: GraphMode
+}) {
   const swatch = 'inline-block w-3.5 h-3.5 rounded border-2'
   return (
     <div className="flex items-center gap-3 px-2.5 py-1.5 rounded-md border border-slate-200 dark:border-slate-700 bg-white/90 dark:bg-slate-900/90 text-[11px] text-slate-600 dark:text-slate-300 shadow-sm">
       <span className="flex items-center gap-1.5"><span className={`${swatch} ${TABLE_NODE_COLOR}`} />Table</span>
       {hasViews && <span className="flex items-center gap-1.5"><span className={`${swatch} ${VIEW_NODE_COLOR}`} />View</span>}
+      {hasStoredProcedures && (
+        <span className="flex items-center gap-1.5" title="Stored procedure: holds the processes it ran. Click its arrow to show or hide them.">
+          <span className={`${swatch} ${STORED_PROCEDURE_COLOR}`} />Stored procedure
+        </span>
+      )}
       {mode === 'mapping' ? (
         <span className="flex items-center gap-1.5" title="Source table/view → target table/view: data is mapped from one to the other (maps_to)">
           <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.mapping} strokeWidth="2" /></svg>
@@ -303,6 +252,18 @@ function Legend({ hasViews, mode }: { hasViews: boolean; mode: GraphMode }) {
             <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.output} strokeWidth="2" strokeDasharray="4 3" /></svg>
             write
           </span>
+          {hasDirect && (
+            <span className="flex items-center gap-1.5" title="Source table/view → view: a view has no process, so it is linked straight to what it maps from (maps_to)">
+              <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.direct} strokeWidth="2" /></svg>
+              maps to
+            </span>
+          )}
+          {hasCalls && (
+            <span className="flex items-center gap-1.5" title="Stored procedure → stored procedure: the first one calls the second">
+              <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.calls} strokeWidth="2" /></svg>
+              calls
+            </span>
+          )}
         </>
       )}
     </div>
@@ -314,26 +275,71 @@ interface CanvasProps {
   edges: Edge[]
   mode: GraphMode
   onTableClick: (fullName: string) => void
+  /** Opens or closes the stored-procedure box with this `full_name`. */
+  onToggleContainer: (fullName: string) => void
   /** Frame just these nodes on first render instead of the whole graph (which may be far too big to read). */
   fitNodeIds?: string[]
 }
 
-// Seeds React Flow's node/edge state from props once, on mount. FlowGraph gives
-// this a fresh `key` whenever the graph or focus changes, so a new layout is
-// picked up by remounting — which also re-runs `fitView` for the new node set
-// (it only fits once per mount) and drops any manual dragging; positions are
-// session-only, not persisted, so that reset is intentional.
-function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableClick, fitNodeIds }: CanvasProps) {
+// Seeds React Flow's node/edge state from props on mount. FlowGraph gives this a fresh
+// `key` whenever the graph or focus changes, so a new layout is picked up by remounting —
+// which also re-runs `fitView` for the new node set (it only fits once per mount) and drops
+// any manual dragging; positions are session-only, not persisted, so that reset is intentional.
+//
+// Opening or closing a stored-procedure box doesn't change the key: it re-lays the graph out,
+// which arrives here as new `nodes`/`edges` props that replace the state (dragging is dropped
+// as above). The viewport is left alone, except that it is shifted so the box that was
+// clicked stays where it was on screen instead of being carried off by the new layout.
+function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableClick, onToggleContainer, fitNodeIds }: CanvasProps) {
   const { theme } = useTheme()
-  const [nodes, , onNodesChange] = useNodesState<Node>(initialNodes)
-  const [edges, , onEdgesChange] = useEdgesState<Edge>(initialEdges)
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>(initialNodes)
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initialEdges)
+  const flow = useRef<ReactFlowInstance | null>(null)
+  const anchor = useRef<{ id: string; x: number; y: number } | null>(null)
+
+  const mounted = useRef(false)
+  useEffect(() => {
+    if (!mounted.current) {
+      mounted.current = true
+      return
+    }
+    setNodes(initialNodes)
+    setEdges(initialEdges)
+  }, [initialNodes, initialEdges, setNodes, setEdges])
+
+  // Runs once the re-laid-out nodes are in place: put the clicked box back where it was on screen.
+  useEffect(() => {
+    const at = anchor.current
+    const instance = flow.current
+    if (!at || !instance) return
+    anchor.current = null
+    requestAnimationFrame(() => {
+      const node = instance.getNode(at.id)
+      if (!node) return
+      const now = instance.flowToScreenPosition(node.position)
+      const view = instance.getViewport()
+      void instance.setViewport({ x: view.x + at.x - now.x, y: view.y + at.y - now.y, zoom: view.zoom })
+    })
+  }, [nodes])
+
+  const toggleContainer = useCallback((nodeId: string, fullName: string) => {
+    const instance = flow.current
+    const node = instance?.getNode(nodeId)
+    if (instance && node) {
+      const screen = instance.flowToScreenPosition(node.position)
+      anchor.current = { id: nodeId, x: screen.x, y: screen.y }
+    }
+    onToggleContainer(fullName)
+  }, [onToggleContainer])
 
   return (
+    <ContainerToggleContext.Provider value={toggleContainer}>
     <ReactFlow
       nodes={nodes}
       edges={edges}
       onNodesChange={onNodesChange}
       onEdgesChange={onEdgesChange}
+      onInit={instance => { flow.current = instance }}
       onNodeClick={(_, node) => {
         if (node.type === 'table' && typeof node.data.fullName === 'string') onTableClick(node.data.fullName)
       }}
@@ -356,9 +362,16 @@ function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableCl
       <Controls />
       <MiniMap pannable zoomable />
       <Panel position="top-left">
-        <Legend hasViews={initialNodes.some(n => n.data.isView)} mode={mode} />
+        <Legend
+          hasViews={initialNodes.some(n => n.data.isView)}
+          hasDirect={initialEdges.some(e => e.data?.kind === 'direct')}
+          hasStoredProcedures={initialNodes.some(n => n.type === 'stored_procedure')}
+          hasCalls={initialEdges.some(e => e.data?.kind === 'calls')}
+          mode={mode}
+        />
       </Panel>
     </ReactFlow>
+    </ContainerToggleContext.Provider>
   )
 }
 
@@ -384,24 +397,40 @@ export default function FlowGraph({ folder, focusTable, onFocusChange, focusScop
     // Deliberately keyed on cacheKey alone: refetch only when the folder or mode changes.
   }, [cacheKey])
 
+  // `full_name`s of the stored-procedure boxes that are open; everything starts collapsed.
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
+  const toggleContainer = useCallback((fullName: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev)
+      if (!next.delete(fullName)) next.add(fullName)
+      return next
+    })
+  }, [])
+
   // Full layout is cached separately so Reset returns to it without re-running dagre.
-  const fullLayout = useMemo(() => (graph ? layout(graph) : null), [graph])
+  const fullLayout = useMemo(() => (graph ? layoutLineage(graph, expanded) : null), [graph, expanded])
   const focused = useMemo(
     () => (graph && focusTable ? focusLineage(graph, focusTable, focusScope) : null),
     [graph, focusTable, focusScope],
   )
   const focusedLayout = useMemo(
     () => (focused
-      ? layout(focused.graph, focusTable, focusScope === 'full'
+      ? layoutLineage(focused.graph, expanded, focusTable, focusScope === 'full'
         ? { nodeIds: focused.pathNodeIds, edgeKeys: focused.pathEdgeKeys }
         : undefined)
       : null),
-    [focused, focusTable, focusScope],
+    [focused, expanded, focusTable, focusScope],
   )
 
   const isMapping = graphMode === 'mapping'
   const shown = focusTable ? focusedLayout : fullLayout
   const graphEmpty = !loading && !error && !!graph && graph.nodes.length === 0
+  // The path's processes may be folded into a collapsed box, so frame only nodes that are actually drawn.
+  const fitNodeIds = useMemo(() => {
+    if (!shown || !focusTable || focusScope !== 'full' || !focused) return undefined
+    const drawn = new Set(shown.nodes.map(n => n.id))
+    return [...focused.pathNodeIds].filter(id => drawn.has(id))
+  }, [shown, focusTable, focusScope, focused])
 
   // The selector and banner render in every state, including loading/error/empty, so a
   // mode with nothing to show (e.g. no maps_to edges) can always be switched away from.
@@ -427,7 +456,8 @@ export default function FlowGraph({ folder, focusTable, onFocusChange, focusScop
               edges={shown.edges}
               mode={graphMode}
               onTableClick={onFocusChange}
-              fitNodeIds={focusTable && focusScope === 'full' && focused ? [...focused.pathNodeIds] : undefined}
+              onToggleContainer={toggleContainer}
+              fitNodeIds={fitNodeIds}
             />
           </div>
         ) : (
@@ -463,6 +493,7 @@ export default function FlowGraph({ folder, focusTable, onFocusChange, focusScop
               {plural(focused.upstreamTables, 'upstream table')} · {plural(focused.downstreamTables, 'downstream table')}
               {focusScope === 'full' && <> · {plural(focused.relatedTables, 'related table')} (dimmed)</>}
               {focused.processes > 0 && <> · {plural(focused.processes, 'process', 'processes')}</>}
+              {focused.storedProcedures > 0 && <> · {plural(focused.storedProcedures, 'stored procedure')}</>}
             </span>
           )}
           <div className="ml-auto flex items-center gap-2">

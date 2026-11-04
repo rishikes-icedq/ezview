@@ -57,6 +57,22 @@ def parse_fqn(fqn: str) -> dict[str, Any]:
     return {"type": "unresolved", "raw": s}
 
 
+# Endpoints the pipeline tags with one of these are never tables/views/columns,
+# even when their FQN is the same depth as one — e.g. a stored procedure's FQN is
+# /system/platform/database/schema/name, which parse_fqn reads as a table.
+_NON_TABLE_TYPES = {"dataprocess", "stored_procedure"}
+
+
+def _asset_side_rows(edges_df: pd.DataFrame, side: str) -> pd.DataFrame:
+    """`edges_df` without the rows whose `side` ("source"/"target") endpoint is
+    tagged (via <side>_type) as a process or stored procedure rather than a
+    table/view/column. Returns it unchanged if the type column is absent."""
+    type_col = f"{side}_type"
+    if type_col not in edges_df.columns:
+        return edges_df
+    return edges_df[~edges_df[type_col].astype(str).str.lower().isin(_NON_TABLE_TYPES)]
+
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
@@ -73,10 +89,11 @@ def compute_summary(
     columns: set[str] = set()
     systems: set[str] = set()
 
-    for col in ("source_fqn", "target_fqn"):
+    for side in ("source", "target"):
+        col = f"{side}_fqn"
         if col not in edges_df.columns:
             continue
-        for raw in edges_df[col].dropna().unique():
+        for raw in _asset_side_rows(edges_df, side)[col].dropna().unique():
             p = parse_fqn(str(raw))
             t = p["type"]
             if t not in ("column", "table"):
@@ -128,7 +145,7 @@ def build_asset_tree(edges_df: pd.DataFrame) -> list[dict[str, Any]]:
         if col not in edges_df.columns:
             continue
         cols = [col, "process_fqn"] if has_process else [col]
-        for row in edges_df[cols].dropna(subset=[col]).itertuples(index=False):
+        for row in _asset_side_rows(edges_df, role)[cols].dropna(subset=[col]).itertuples(index=False):
             p = parse_fqn(str(row[0]))
             if p["type"] not in ("column", "table"):
                 continue
@@ -289,17 +306,15 @@ def _process_io(edges_df: pd.DataFrame) -> tuple[dict[str, list[str]], dict[str,
     if "process_fqn" not in edges_df.columns:
         return proc_inputs, proc_outputs
 
-    cols = [c for c in ("source_fqn", "target_fqn", "process_fqn") if c in edges_df.columns]
-    for row in edges_df[cols].dropna(subset=["process_fqn"]).itertuples(index=False):
-        proc = str(row.process_fqn)
-        if "source_fqn" in cols and pd.notna(row.source_fqn):
-            src = parse_fqn(str(row.source_fqn))
-            if src["type"] in ("column", "table"):
-                proc_inputs.setdefault(proc, []).append(_table_key(src))
-        if "target_fqn" in cols and pd.notna(row.target_fqn):
-            tgt = parse_fqn(str(row.target_fqn))
-            if tgt["type"] in ("column", "table"):
-                proc_outputs.setdefault(proc, []).append(_table_key(tgt))
+    for side, bucket in (("source", proc_inputs), ("target", proc_outputs)):
+        fqn_col = f"{side}_fqn"
+        if fqn_col not in edges_df.columns:
+            continue
+        rows = _asset_side_rows(edges_df, side)[[fqn_col, "process_fqn"]].dropna()
+        for fqn, proc in rows.itertuples(index=False):
+            parsed = parse_fqn(str(fqn))
+            if parsed["type"] in ("column", "table"):
+                bucket.setdefault(str(proc), []).append(_table_key(parsed))
     return proc_inputs, proc_outputs
 
 
@@ -318,6 +333,42 @@ def _view_table_keys(edges_df: pd.DataFrame) -> set[str]:
             if p["type"] in ("column", "table"):
                 keys.add(_table_key(p))
     return keys
+
+
+def _last_segment(fqn: str) -> str:
+    return str(fqn).rstrip("/").rsplit("/", 1)[-1]
+
+
+def _stored_procedure_links(edges_df: pd.DataFrame) -> tuple[dict[str, list[str]], list[tuple[str, str]]]:
+    """Stored-procedure structure, from the two edge labels that describe it.
+
+    Returns (process_fqn -> FQNs of the stored procedures that ran it, ordered
+    (caller FQN, callee FQN) pairs). A `contextualizes` edge runs from a stored
+    procedure to a data process it produced — one procedure can have several —
+    and a `calls` edge from a procedure to another procedure it invokes. `calls`
+    edges carry no process_fqn: a procedure that only calls others runs no
+    process of its own.
+    """
+    sp_of_process: dict[str, list[str]] = {}
+    calls: list[tuple[str, str]] = []
+    if "edge" not in edges_df.columns:
+        return sp_of_process, calls
+    label = edges_df["edge"].astype(str).str.lower()
+
+    if {"source_fqn", "process_fqn"} <= set(edges_df.columns):
+        linked = edges_df.loc[label == "contextualizes", ["source_fqn", "process_fqn"]].dropna()
+        for sp, proc in linked.itertuples(index=False):
+            procedures = sp_of_process.setdefault(str(proc), [])
+            if str(sp) not in procedures:
+                procedures.append(str(sp))
+
+    if {"source_fqn", "target_fqn"} <= set(edges_df.columns):
+        called = edges_df.loc[label == "calls", ["source_fqn", "target_fqn"]].dropna()
+        for caller, callee in called.itertuples(index=False):
+            pair = (str(caller), str(callee))
+            if pair[0] != pair[1] and pair not in calls:
+                calls.append(pair)
+    return sp_of_process, calls
 
 
 def get_flow_pairs(edges_df: pd.DataFrame) -> list[dict[str, Any]]:
@@ -371,9 +422,22 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
     and process->table ("output") edges — the actual step-by-step path data
     takes, not just an aggregated table-to-table summary (see get_flow_pairs
     for that view).
+
+    Views have no data process: the pipeline records a view's `maps_to` edges
+    with the view's own FQN as their process_fqn. Rather than draw that as a
+    bogus process node between the view and its sources, each source is linked
+    straight to the view with a "direct" edge.
+
+    Stored procedures are assets of their own: each becomes a "stored_procedure"
+    node that contains the processes it ran (a process node's `parent_id` is its
+    procedure's node id, per the `contextualizes` edges), and a procedure that
+    invokes another is linked to it with a "calls" edge. The table<->process
+    edges stay attached to the processes themselves, so a client can fold them
+    onto the container when it is collapsed.
     """
     proc_inputs, proc_outputs = _process_io(edges_df)
     view_keys = _view_table_keys(edges_df)
+    sp_of_process, sp_calls = _stored_procedure_links(edges_df)
 
     proc_meta: dict[str, dict] = {}
     if processes_df is not None and "process_fqn" in processes_df.columns:
@@ -387,6 +451,7 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
     # contain "/", ".", ":" which are unsafe to use as DOM/SVG element ids.
     table_ids: dict[str, str] = {}
     process_ids: dict[str, str] = {}
+    sp_ids: dict[str, str] = {}
     nodes: list[dict] = []
     counter = 0
 
@@ -398,19 +463,39 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
             nodes.append(_table_node(table_ids[key], key, view_keys))
         return table_ids[key]
 
+    def get_sp_id(fqn: str) -> str:
+        nonlocal counter
+        if fqn not in sp_ids:
+            sp_ids[fqn] = f"n{counter}"
+            counter += 1
+            parsed = parse_fqn(fqn)
+            nodes.append({
+                "id": sp_ids[fqn],
+                "type": "stored_procedure",
+                "fqn": fqn,
+                # database.schema.name, like a table's full_name — a stable key for the UI.
+                "full_name": _table_key(parsed) if parsed["type"] in ("column", "table") else fqn,
+                "label": _last_segment(fqn),
+            })
+        return sp_ids[fqn]
+
     def get_process_id(proc: str) -> str:
         nonlocal counter
         if proc not in process_ids:
             process_ids[proc] = f"n{counter}"
             counter += 1
             meta = proc_meta.get(proc, {})
+            # A process sits inside one container; if several procedures claim it, the first by FQN wins.
+            owners = sorted(sp_of_process.get(proc, []))
             nodes.append({
                 "id": process_ids[proc],
                 "type": "process",
                 "process_fqn": proc,
                 "label": meta.get("process_name") or proc.rsplit("/", 1)[-1][:12],
+                "process_type": meta.get("process_type"),
                 "query_type": meta.get("query_type"),
                 "process_code": meta.get("process_code"),
+                "parent_id": get_sp_id(owners[0]) if owners else None,
             })
         return process_ids[proc]
 
@@ -425,11 +510,23 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
         edges.append({"source": source, "target": target, "kind": kind})
 
     for proc in set(proc_inputs) | set(proc_outputs):
+        if parse_fqn(proc)["type"] in ("column", "table"):
+            # The "process" is itself a table/view FQN, so no real process exists.
+            for src_key in set(proc_inputs.get(proc, [])):
+                for tgt_key in set(proc_outputs.get(proc, [])):
+                    if src_key != tgt_key:
+                        add_edge(get_table_id(src_key), get_table_id(tgt_key), "direct")
+            continue
         proc_id = get_process_id(proc)
         for tbl in set(proc_inputs.get(proc, [])):
             add_edge(get_table_id(tbl), proc_id, "input")
         for tbl in set(proc_outputs.get(proc, [])):
             add_edge(proc_id, get_table_id(tbl), "output")
+
+    # Procedure -> procedure calls, drawn between the containers whether or not
+    # either has processes of its own.
+    for caller, callee in sp_calls:
+        add_edge(get_sp_id(caller), get_sp_id(callee), "calls")
 
     return {"nodes": nodes, "edges": edges}
 

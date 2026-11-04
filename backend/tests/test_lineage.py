@@ -371,6 +371,164 @@ def test_lineage_graph_without_type_columns_has_no_views():
 
 
 # ---------------------------------------------------------------------------
+# Views without a data process (and stored procedures)
+# ---------------------------------------------------------------------------
+
+V = "/sys1/platform1/db1/schema1"
+
+
+def _typed_row(edge, source_fqn, target_fqn, source_type, target_type, process_fqn):
+    return {
+        "edge": edge,
+        "source_fqn": source_fqn,
+        "source_type": source_type,
+        "target_fqn": target_fqn,
+        "target_type": target_type,
+        "process_fqn": process_fqn,
+    }
+
+
+# The pipeline gives a view no dataprocess: its maps_to rows carry the view's own
+# FQN as process_fqn. A real process (p1, a stored-procedure call) still exists
+# alongside, tied to its stored procedure by a "contextualizes" edge.
+NO_PROCESS_VIEW_ROWS = [
+    # v1 <- base_table (a table-level row plus two column-level rows, one duplicated)
+    _typed_row("maps_to", f"{V}/base_table", f"{V}/v1", "table", "view", f"{V}/v1"),
+    _typed_row("maps_to", f"{V}/base_table/a", f"{V}/v1/x", "column", "column", f"{V}/v1"),
+    _typed_row("maps_to", f"{V}/base_table/b", f"{V}/v1/y", "column", "column", f"{V}/v1"),
+    _typed_row("maps_to", f"{V}/base_table/b", f"{V}/v1/y", "column", "column", f"{V}/v1"),
+    # v2 <- v1 and other_table
+    _typed_row("maps_to", f"{V}/v1", f"{V}/v2", "view", "view", f"{V}/v2"),
+    _typed_row("maps_to", f"{V}/other_table", f"{V}/v2", "table", "view", f"{V}/v2"),
+    # p1 reads v2 and writes final_table
+    _typed_row("read_by", f"{V}/v2", "/sys1/platform1/dataprocess/p1", "view", "dataprocess", "/sys1/platform1/dataprocess/p1"),
+    _typed_row("writes_to", "/sys1/platform1/dataprocess/p1", f"{V}/final_table", "dataprocess", "table", "/sys1/platform1/dataprocess/p1"),
+    # sp_load is a stored procedure whose FQN is table-shaped
+    _typed_row("contextualizes", f"{V}/sp_load", "/sys1/platform1/dataprocess/p1", "stored_procedure", "dataprocess", "/sys1/platform1/dataprocess/p1"),
+]
+
+
+def test_lineage_graph_view_without_process_links_sources_directly():
+    graph = get_lineage_graph(pd.DataFrame(NO_PROCESS_VIEW_ROWS), None)
+    name = {n["id"]: n.get("full_name") or n["process_fqn"] for n in graph["nodes"]}
+
+    # no process node is invented for a view — only the real p1 exists
+    assert [n["process_fqn"] for n in graph["nodes"] if n["type"] == "process"] == ["/sys1/platform1/dataprocess/p1"]
+
+    links = {(name[e["source"]], name[e["target"]], e["kind"]) for e in graph["edges"]}
+    assert links == {
+        ("db1.schema1.base_table", "db1.schema1.v1", "direct"),   # table + column rows collapse to one edge
+        ("db1.schema1.v1", "db1.schema1.v2", "direct"),           # a view can feed a view
+        ("db1.schema1.other_table", "db1.schema1.v2", "direct"),
+        ("db1.schema1.v2", "/sys1/platform1/dataprocess/p1", "input"),   # real processes are untouched
+        ("/sys1/platform1/dataprocess/p1", "db1.schema1.final_table", "output"),
+    }
+    is_view = {n["full_name"]: n["is_view"] for n in graph["nodes"] if n["type"] == "table"}
+    assert is_view["db1.schema1.v1"] and is_view["db1.schema1.v2"]
+    assert not is_view["db1.schema1.base_table"]
+
+
+def test_lineage_graph_view_with_real_process_has_no_direct_edges():
+    # Older pipelines gave a view a CREATE_VIEW process: that path must be unchanged.
+    graph = get_lineage_graph(pd.DataFrame(VIEW_ROWS), None)
+    assert {e["kind"] for e in graph["edges"]} == {"input", "output"}
+    assert sum(1 for n in graph["nodes"] if n["type"] == "process") == 2
+
+
+def _sp_graph(rows, processes=None):
+    graph = get_lineage_graph(pd.DataFrame(rows), None if processes is None else pd.DataFrame(processes))
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    sps = {n["label"]: n for n in graph["nodes"] if n["type"] == "stored_procedure"}
+    procs = {n["process_fqn"]: n for n in graph["nodes"] if n["type"] == "process"}
+    calls = {(by_id[e["source"]]["label"], by_id[e["target"]]["label"]) for e in graph["edges"] if e["kind"] == "calls"}
+    return graph, by_id, sps, procs, calls
+
+
+def _proc(n):
+    return f"/sys1/platform1/dataprocess/{n}"
+
+
+def _io_rows(proc_fqn, src, dst):
+    return [
+        _typed_row("read_by", f"{V}/{src}", proc_fqn, "table", "dataprocess", proc_fqn),
+        _typed_row("writes_to", proc_fqn, f"{V}/{dst}", "dataprocess", "table", proc_fqn),
+    ]
+
+
+def test_stored_procedure_node_contains_the_process_it_contextualizes():
+    rows = NO_PROCESS_VIEW_ROWS + [
+        # sp_load calls sp_helper: a nested call has no process, and must not disturb the rest
+        _typed_row("calls", f"{V}/sp_load", f"{V}/sp_helper", "stored_procedure", "stored_procedure", None),
+    ]
+    processes = [{"process_fqn": _proc("p1"), "process_name": "CALL schema1.sp_load", "process_type": "sql", "query_type": "storedprocedure"}]
+    graph, by_id, sps, procs, calls = _sp_graph(rows, processes)
+
+    load = sps["sp_load"]
+    # the container's name is the last segment of the stored procedure's FQN
+    assert load["fqn"] == f"{V}/sp_load" and load["full_name"] == "db1.schema1.sp_load"
+    p1 = procs[_proc("p1")]
+    assert p1["parent_id"] == load["id"]
+    assert p1["process_type"] == "sql" and p1["query_type"] == "storedprocedure"
+    assert set(sps) == {"sp_load", "sp_helper"}
+    assert calls == {("sp_load", "sp_helper")}
+    # a stored procedure is not a table, whichever edge mentions it
+    assert not any(n["type"] == "table" and n["label"].startswith("sp_") for n in graph["nodes"])
+
+
+def test_process_without_a_stored_procedure_has_no_container():
+    graph, _, sps, procs, calls = _sp_graph(VIEW_ROWS)
+    assert procs and not sps and not calls
+    assert all(n["parent_id"] is None and n["process_type"] is None for n in procs.values())
+
+
+def test_stored_procedure_with_several_processes_and_calls():
+    rows = (
+        _io_rows(_proc("p1"), "t1", "t2")
+        + _io_rows(_proc("p2"), "t2", "t3")
+        # sp_a ran both processes, and calls sp_b (which ran nothing) and sp_c
+        + [
+            _typed_row("contextualizes", f"{V}/sp_a", _proc("p1"), "stored_procedure", "dataprocess", _proc("p1")),
+            _typed_row("contextualizes", f"{V}/sp_a", _proc("p2"), "stored_procedure", "dataprocess", _proc("p2")),
+            _typed_row("calls", f"{V}/sp_a", f"{V}/sp_b", "stored_procedure", "stored_procedure", None),
+            _typed_row("calls", f"{V}/sp_a", f"{V}/sp_c", "stored_procedure", "stored_procedure", None),
+            _typed_row("calls", f"{V}/sp_a", f"{V}/sp_c", "stored_procedure", "stored_procedure", None),  # duplicate
+            _typed_row("calls", f"{V}/sp_b", f"{V}/sp_b", "stored_procedure", "stored_procedure", None),  # self-call: dropped
+        ]
+    )
+    graph, by_id, sps, procs, calls = _sp_graph(rows)
+    assert {p["parent_id"] for p in procs.values()} == {sps["sp_a"]["id"]}
+    assert set(sps) == {"sp_a", "sp_b", "sp_c"}
+    assert calls == {("sp_a", "sp_b"), ("sp_a", "sp_c")}
+    assert sum(1 for e in graph["edges"] if e["kind"] == "calls") == 2
+    # table<->process edges stay on the processes, so a client can fold them onto the container
+    io = {(by_id[e["source"]]["label"], by_id[e["target"]]["label"], e["kind"]) for e in graph["edges"] if e["kind"] != "calls"}
+    assert io == {("t1", "p1", "input"), ("p1", "t2", "output"), ("t2", "p2", "input"), ("p2", "t3", "output")}
+
+
+def test_process_claimed_by_several_stored_procedures_goes_to_the_first_by_fqn():
+    rows = _io_rows(_proc("p1"), "src", "dst") + [
+        _typed_row("contextualizes", f"{V}/sp_b", _proc("p1"), "stored_procedure", "dataprocess", _proc("p1")),
+        _typed_row("contextualizes", f"{V}/sp_a", _proc("p1"), "stored_procedure", "dataprocess", _proc("p1")),
+    ]
+    _, _, sps, procs, _ = _sp_graph(rows)
+    assert procs[_proc("p1")]["parent_id"] == sps["sp_a"]["id"]
+
+
+def test_stored_procedure_is_not_a_table():
+    # `contextualizes` links a stored procedure to the process that ran it. Its FQN is
+    # table-shaped, but the endpoint is tagged stored_procedure, so it is not an asset.
+    df = pd.DataFrame(NO_PROCESS_VIEW_ROWS)
+    tables = {n["full_name"] for n in get_lineage_graph(df, None)["nodes"] if n["type"] == "table"}
+    assert tables == {f"db1.schema1.{t}" for t in ("base_table", "v1", "v2", "other_table", "final_table")}
+
+    asset_tables = {t["table"] for db in build_asset_tree(df) for s in db["schemas"] for t in s["tables"]}
+    assert asset_tables == {"base_table", "v1", "v2", "other_table", "final_table"}
+    assert compute_summary(df, pd.DataFrame())["unique_tables"] == 5
+    # flow pairs never treat the stored procedure as a source table either
+    assert all("sp_load" not in p["source_table"] for p in get_flow_pairs(df))
+
+
+# ---------------------------------------------------------------------------
 # get_mapping_graph
 # ---------------------------------------------------------------------------
 

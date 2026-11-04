@@ -6,6 +6,11 @@ import type { LineageGraph, LineageGraphEdge } from '../types'
  * - `full`: everything connected to it, ignoring direction — also the other
  *   inputs/outputs of every process on the way, and *their* lineage in turn.
  *   (A view built from 148 tables shows all 148, not just the one you clicked.)
+ *
+ * Stored procedures don't extend either: `calls` edges say which procedure
+ * invokes which, not where data flows, so they are never walked. A procedure's
+ * container is shown (and counts as on the chain) whenever one of its processes
+ * is, and a `calls` edge is shown when both its procedures are.
  */
 export type FocusScope = 'direct' | 'full'
 
@@ -20,6 +25,7 @@ export interface FocusedLineage {
   /** Tables shown only because of `full` scope (always 0 for `direct`). */
   relatedTables: number
   processes: number
+  storedProcedures: number
 }
 
 export const edgeKey = (e: LineageGraphEdge) => `${e.source}|${e.target}|${e.kind}`
@@ -41,6 +47,7 @@ export function focusLineage(graph: LineageGraph, fullName: string, scope: Focus
     else m.set(nodeId, [edgeIdx])
   }
   graph.edges.forEach((e, i) => {
+    if (e.kind === 'calls') return
     index(incoming, e.target, i)
     index(outgoing, e.source, i)
   })
@@ -68,21 +75,21 @@ export function focusLineage(graph: LineageGraph, fullName: string, scope: Focus
 
   const upstream = walk(incoming, i => graph.edges[i].source)
   const downstream = walk(outgoing, i => graph.edges[i].target)
-  const pathNodeIds = new Set<string>([...upstream, ...downstream])
+  const walked = new Set<string>([...upstream, ...downstream])
 
-  let shownNodeIds = pathNodeIds
+  let shown = walked
   if (scope === 'full') {
     // Connected component ignoring direction. Stopping at nodes already seen is
     // enough: every edge of a visited node has both ends in the component.
-    shownNodeIds = new Set<string>([start.id])
+    shown = new Set<string>([start.id])
     const stack = [start.id]
     while (stack.length) {
       const id = stack.pop()!
       for (const i of [...(incoming.get(id) ?? []), ...(outgoing.get(id) ?? [])]) {
         const e = graph.edges[i]
         for (const next of [e.source, e.target]) {
-          if (!shownNodeIds.has(next)) {
-            shownNodeIds.add(next)
+          if (!shown.has(next)) {
+            shown.add(next)
             stack.push(next)
           }
         }
@@ -90,21 +97,39 @@ export function focusLineage(graph: LineageGraph, fullName: string, scope: Focus
     }
   }
 
+  // Add the containers of the processes that made it in.
+  const parentOf = new Map(graph.nodes.map(n => [n.id, n.parent_id ?? null]))
+  const withContainers = (ids: Set<string>): Set<string> => {
+    const all = new Set(ids)
+    for (const id of ids) {
+      const parent = parentOf.get(id)
+      if (parent) all.add(parent)
+    }
+    return all
+  }
+  const pathNodeIds = withContainers(walked)
+  const shownNodeIds = withContainers(shown)
+
   const nodes = graph.nodes.filter(n => shownNodeIds.has(n.id))
-  const edges = scope === 'full'
-    ? graph.edges.filter(e => shownNodeIds.has(e.source))
+  const dataEdges = scope === 'full'
+    ? graph.edges.filter(e => e.kind !== 'calls' && shownNodeIds.has(e.source))
     : graph.edges.filter((_, i) => pathEdges.has(i))
+  const callEdges = graph.edges.filter(e => e.kind === 'calls' && shownNodeIds.has(e.source) && shownNodeIds.has(e.target))
 
   const tableCount = (ids: Set<string>) =>
     nodes.filter(n => n.type === 'table' && n.id !== start.id && ids.has(n.id)).length
 
   return {
-    graph: { nodes, edges },
+    graph: { nodes, edges: [...dataEdges, ...callEdges] },
     pathNodeIds,
-    pathEdgeKeys: new Set(graph.edges.filter((_, i) => pathEdges.has(i)).map(edgeKey)),
+    pathEdgeKeys: new Set([
+      ...graph.edges.filter((_, i) => pathEdges.has(i)).map(edgeKey),
+      ...callEdges.filter(e => pathNodeIds.has(e.source) && pathNodeIds.has(e.target)).map(edgeKey),
+    ]),
     upstreamTables: tableCount(upstream),
     downstreamTables: tableCount(downstream),
     relatedTables: nodes.filter(n => n.type === 'table' && !pathNodeIds.has(n.id)).length,
     processes: nodes.filter(n => n.type === 'process').length,
+    storedProcedures: nodes.filter(n => n.type === 'stored_procedure').length,
   }
 }

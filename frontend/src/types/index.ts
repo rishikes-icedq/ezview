@@ -126,21 +126,31 @@ export interface ProcessRecord {
 
 export interface LineageGraphNode {
   id: string
-  type: 'table' | 'process'
+  type: 'table' | 'process' | 'stored_procedure'
   label: string
+  /** Tables: `database.schema.table`. Stored procedures: `database.schema.name`. */
   full_name?: string
   /** Table nodes only: the pipeline tags this object as a view rather than a table. */
   is_view?: boolean
   process_fqn?: string
+  process_type?: string | null
   query_type?: string | null
   process_code?: string | null
+  /** Process nodes only: id of the stored_procedure node that ran it (null for a process with no procedure). */
+  parent_id?: string | null
+  /** Stored-procedure nodes only: the procedure's FQN; its last segment is `label`. */
+  fqn?: string
 }
 
 export interface LineageGraphEdge {
   source: string
   target: string
-  /** input = table→process (read), output = process→table (write), mapping = table/view→table/view via maps_to. */
-  kind: 'input' | 'output' | 'mapping'
+  /**
+   * input = table→process (read), output = process→table (write), mapping = table/view→table/view via maps_to
+   * (data-mapping mode), direct = the same maps_to link drawn inside the full graph for a view, which has no
+   * process to route through, calls = stored procedure → stored procedure it invokes.
+   */
+  kind: 'input' | 'output' | 'mapping' | 'direct' | 'calls'
   /** Mapping edges only: how many column-to-column mappings back this link (0 = a table-level link only). */
   column_count?: number
 }
