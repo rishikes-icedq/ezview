@@ -23,6 +23,10 @@ export function parseFqn(fqn: string): ParsedFqn {
   if (rest[0]?.toLowerCase() === 'dataprocess') {
     return { type: 'dataprocess', system, process_id: rest[1] ?? '', raw: fqn }
   }
+  // Newer bundles put the platform in front: /system/platform/dataprocess/hash.
+  if (rest.length === 3 && rest[1].toLowerCase() === 'dataprocess') {
+    return { type: 'dataprocess', system, platform: rest[0], process_id: rest[2], raw: fqn }
+  }
 
   // The pipeline inserts an explicit platform segment right after the system
   // name: /system/platform/database/schema/table[/column] — one level

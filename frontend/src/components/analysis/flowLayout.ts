@@ -33,6 +33,8 @@ export const EDGE_COLOR: Record<LineageGraphEdge['kind'], string> = {
   direct: '#d946ef',
   // Same hue as the stored-procedure box.
   calls: '#eab308',
+  // Power BI: an asset feeding the asset built on it.
+  uses: '#0ea5e9',
 }
 
 const plural = (n: number, singular: string) => `${n} ${n === 1 ? singular : `${singular}s`}`
@@ -170,7 +172,7 @@ export function layoutLineage(
       nodes.push({
         ...base,
         type: 'table',
-        data: { label: n.label, fullName: n.full_name, isView: n.is_view, focused: focusTable !== null && n.full_name === focusTable },
+        data: { label: n.label, fullName: n.full_name, isView: n.is_view, assetType: n.asset_type, focused: focusTable !== null && n.full_name === focusTable },
       })
     } else if (n.type === 'process') {
       nodes.push({ ...base, type: 'process', data: processData(n) })

@@ -5,6 +5,7 @@ import math
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import pandas as pd
 
@@ -38,6 +39,9 @@ def parse_fqn(fqn: str) -> dict[str, Any]:
             "process_id": rest[1] if len(rest) > 1 else "",
             "raw": s,
         }
+    # Newer bundles put the platform in front: /system/platform/dataprocess/hash.
+    if len(rest) == 3 and rest[1].lower() == "dataprocess":
+        return {"type": "dataprocess", "system": system, "platform": rest[0], "process_id": rest[2], "raw": s}
 
     # The pipeline inserts an explicit platform segment right after the
     # system name: /system/platform/database/schema/table[/column] — one
@@ -74,8 +78,102 @@ def _asset_side_rows(edges_df: pd.DataFrame, side: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Type-aware endpoint parsing (Power BI)
+# ---------------------------------------------------------------------------
+#
+# parse_fqn reads an FQN purely by depth (db/schema/table/column). A Power BI
+# bundle breaks that: its assets are /system/powerbi/<model or report id>/…, at
+# depths that collide with database objects (a field parses as a "table" whose
+# "database" is a model GUID, a measure/tile/data-table as a "schema", a model or
+# report as a "database"). The endpoint's own source_type/target_type tag is the
+# only reliable signal, so parse_asset takes it into account.
+#
+# Every Power BI asset is mapped onto the same database/schema/table[/column]
+# shape the rest of the analysis already works with, so a field rolls up into its
+# data table and a measure into its model just as a column rolls up into a table:
+#
+#   bitable   /sys/powerbi/<model>/<table>            powerbi . <model>     . <table>
+#   bifield   /sys/powerbi/<model>/<table>/<field>    …same table, column = field
+#   bimodel   /sys/powerbi/<model>                    powerbi . <model>     . (model)
+#   bimeasure /sys/powerbi/<model>/<measure>          …the model, column = measure
+#   bireport  /sys/powerbi/<report>                   powerbi . (reports)   . <report>
+#   bitile    /sys/powerbi/<dashboard>/<tile>         powerbi . <dashboard> . <tile>
+#
+# ("powerbi" is the FQN's own platform segment.)
+
+_BI_ASSET_TYPES = {"bimodel", "bireport", "bitile", "bitable", "bifield", "bimeasure"}
+_BI_MODEL_TABLE = "(model)"
+_BI_REPORTS_SCHEMA = "(reports)"
+# Segments after the platform that each Power BI type has, and the node kind it rolls up to.
+_BI_SHAPE: dict[str, tuple[int, str]] = {
+    "bimodel": (1, "bimodel"),
+    "bimeasure": (2, "bimodel"),
+    "bireport": (1, "bireport"),
+    "bitile": (2, "bitile"),
+    "bitable": (2, "bitable"),
+    "bifield": (3, "bitable"),
+}
+
+
+def _decode_names(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Pipeline FQNs percent-encode names ("Dim%20-%20Date"); show them as written."""
+    for field in ("database", "schema", "table", "column"):
+        if field in parsed:
+            parsed[field] = unquote(parsed[field])
+    return parsed
+
+
+def parse_asset(fqn: str, type_tag: Any = None) -> dict[str, Any]:
+    """parse_fqn for an edge endpoint, given that endpoint's source_type/target_type.
+
+    Same result shape as parse_fqn (type is "column", "table", … , database/schema/
+    table/column names percent-decoded), plus `asset_type` for Power BI assets: the
+    kind of node the asset rolls up to ("bitable", "bimodel", "bireport", "bitile").
+    """
+    tag = str(type_tag or "").strip().lower()
+    if tag not in _BI_ASSET_TYPES:
+        return _decode_names(parse_fqn(fqn))
+
+    unresolved = {"type": "unresolved", "raw": fqn}
+    s = str(fqn or "").strip()
+    parts = [p for p in s.split("/") if p] if s.startswith("/") else []
+    expected, asset_type = _BI_SHAPE[tag]
+    if len(parts) != 2 + expected:
+        return unresolved
+    system, platform, *names = parts
+
+    base = {"system": system, "platform": platform, "raw": s, "asset_type": asset_type}
+    if tag in ("bimodel", "bimeasure"):
+        base.update(database=platform, schema=names[0], table=_BI_MODEL_TABLE)
+    elif tag == "bireport":
+        base.update(database=platform, schema=_BI_REPORTS_SCHEMA, table=names[0])
+    else:  # bitable, bitile, bifield: <parent>/<table>[/<field>]
+        base.update(database=platform, schema=names[0], table=names[1])
+    if tag in ("bimeasure", "bifield"):
+        return _decode_names({**base, "type": "column", "column": names[-1]})
+    return _decode_names({**base, "type": "table"})
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+
+def _side_records(edges_df: pd.DataFrame, side: str, extra: tuple[str, ...] = ()) -> pd.DataFrame:
+    """The `side` ("source"/"target") endpoints of `edges_df` that can be an asset,
+    as a frame with columns `fqn`, `tag` (the endpoint's <side>_type, None if the
+    bundle has no such column) and any `extra` edge columns (None where absent).
+    Rows without an FQN are dropped."""
+    fqn_col, type_col = f"{side}_fqn", f"{side}_type"
+    if fqn_col not in edges_df.columns:
+        return pd.DataFrame({"fqn": [], "tag": [], **{c: [] for c in extra}})
+    rows = _asset_side_rows(edges_df, side)
+    frame = pd.DataFrame({
+        "fqn": rows[fqn_col],
+        "tag": rows[type_col] if type_col in rows.columns else None,
+        **{c: rows[c] if c in rows.columns else None for c in extra},
+    })
+    return frame.dropna(subset=["fqn"])
+
 
 def compute_summary(
     edges_df: pd.DataFrame,
@@ -88,18 +186,38 @@ def compute_summary(
     tables: set[str] = set()
     columns: set[str] = set()
     systems: set[str] = set()
+    # Power BI assets, counted on their own: they are not database objects.
+    bi_models: set[str] = set()
+    bi_reports: set[str] = set()
+    bi_tiles: set[tuple] = set()
+    bi_tables: set[tuple] = set()
+    bi_fields: set[tuple] = set()
+    bi_measures: set[tuple] = set()
 
     for side in ("source", "target"):
-        col = f"{side}_fqn"
-        if col not in edges_df.columns:
-            continue
-        for raw in _asset_side_rows(edges_df, side)[col].dropna().unique():
-            p = parse_fqn(str(raw))
+        for raw, tag in _side_records(edges_df, side).drop_duplicates(["fqn", "tag"]).itertuples(index=False):
+            p = parse_asset(str(raw), tag)
             t = p["type"]
             if t not in ("column", "table"):
                 continue
             if "system" in p:
                 systems.add(p["system"])
+            asset = p.get("asset_type")
+            if asset:
+                ids = (p["schema"], p["table"])
+                if asset == "bimodel":
+                    bi_models.add(p["schema"])
+                    if t == "column":
+                        bi_measures.add((p["schema"], p["column"]))
+                elif asset == "bireport":
+                    bi_reports.add(p["table"])
+                elif asset == "bitile":
+                    bi_tiles.add(ids)
+                else:
+                    bi_tables.add(ids)
+                    if t == "column":
+                        bi_fields.add((*ids, p["column"]))
+                continue
             if "database" in p:
                 databases.add(p["database"])
             if "schema" in p:
@@ -114,7 +232,7 @@ def compute_summary(
             return {}
         return {str(k): int(v) for k, v in df[col].value_counts().items()}
 
-    return {
+    summary = {
         "total_processes": int(len(processes_df)),
         "total_edges": int(len(edges_df)),
         "unique_databases": len(databases),
@@ -131,6 +249,13 @@ def compute_summary(
         "query_type_distribution": dist(processes_df, "query_type"),
         "manifest": manifest,
     }
+    bi_assets = {
+        "models": len(bi_models), "reports": len(bi_reports), "tiles": len(bi_tiles),
+        "tables": len(bi_tables), "fields": len(bi_fields), "measures": len(bi_measures),
+    }
+    if any(bi_assets.values()):
+        summary["bi_assets"] = bi_assets
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -139,14 +264,10 @@ def compute_summary(
 
 def build_asset_tree(edges_df: pd.DataFrame) -> list[dict[str, Any]]:
     table_data: dict[tuple, dict] = {}
-    has_process = "process_fqn" in edges_df.columns
 
-    for col, role in (("source_fqn", "source"), ("target_fqn", "target")):
-        if col not in edges_df.columns:
-            continue
-        cols = [col, "process_fqn"] if has_process else [col]
-        for row in _asset_side_rows(edges_df, role)[cols].dropna(subset=[col]).itertuples(index=False):
-            p = parse_fqn(str(row[0]))
+    for role in ("source", "target"):
+        for fqn, tag, proc in _side_records(edges_df, role, ("process_fqn",)).itertuples(index=False):
+            p = parse_asset(str(fqn), tag)
             if p["type"] not in ("column", "table"):
                 continue
             key = (p.get("database", ""), p.get("schema", ""), p.get("table", ""))
@@ -158,8 +279,8 @@ def build_asset_tree(edges_df: pd.DataFrame) -> list[dict[str, Any]]:
             table_data[key][role] += 1
             if p["type"] == "column":
                 table_data[key]["columns"].add(p.get("column", ""))
-            if has_process and pd.notna(row[1]):
-                table_data[key][f"{role}_processes"].add(str(row[1]))
+            if pd.notna(proc):
+                table_data[key][f"{role}_processes"].add(str(proc))
 
     db_map: dict[str, dict[str, list]] = {}
     for (db, schema, table), data in table_data.items():
@@ -307,12 +428,9 @@ def _process_io(edges_df: pd.DataFrame) -> tuple[dict[str, list[str]], dict[str,
         return proc_inputs, proc_outputs
 
     for side, bucket in (("source", proc_inputs), ("target", proc_outputs)):
-        fqn_col = f"{side}_fqn"
-        if fqn_col not in edges_df.columns:
-            continue
-        rows = _asset_side_rows(edges_df, side)[[fqn_col, "process_fqn"]].dropna()
-        for fqn, proc in rows.itertuples(index=False):
-            parsed = parse_fqn(str(fqn))
+        rows = _side_records(edges_df, side, ("process_fqn",)).dropna(subset=["process_fqn"])
+        for fqn, tag, proc in rows.itertuples(index=False):
+            parsed = parse_asset(str(fqn), tag)
             if parsed["type"] in ("column", "table"):
                 bucket.setdefault(str(proc), []).append(_table_key(parsed))
     return proc_inputs, proc_outputs
@@ -329,10 +447,57 @@ def _view_table_keys(edges_df: pd.DataFrame) -> set[str]:
             continue
         tagged = edges_df.loc[edges_df[type_col].astype(str).str.lower() == "view", fqn_col].dropna()
         for fqn in tagged.unique():
-            p = parse_fqn(str(fqn))
+            p = parse_asset(str(fqn))
             if p["type"] in ("column", "table"):
                 keys.add(_table_key(p))
     return keys
+
+
+def _bi_node_kinds(edges_df: pd.DataFrame) -> dict[str, str]:
+    """Table key -> kind ("bitable", "bimodel", "bireport", "bitile") for every
+    Power BI asset in the bundle. Fields roll up into their data table and measures
+    into their model, so those two kinds also cover them."""
+    kinds: dict[str, str] = {}
+    for side in ("source", "target"):
+        records = _side_records(edges_df, side)
+        for fqn, tag in records[records["tag"].astype(str).str.lower().isin(_BI_ASSET_TYPES)].drop_duplicates().itertuples(index=False):
+            p = parse_asset(str(fqn), tag)
+            if p["type"] in ("column", "table"):
+                kinds[_table_key(p)] = p["asset_type"]
+    return kinds
+
+
+def _unmediated_bi_links(edges_df: pd.DataFrame, bi_kinds: dict[str, str]) -> set[tuple[str, str]]:
+    """(source table key, target table key) pairs for Power BI links that no data
+    process sits in the middle of: model -> report/tile, report -> tile, a data
+    table's fields -> the measures computed from them, a source table -> the model
+    that reads it. Fields and measures roll up into their table/model, so a link
+    between two assets inside one table or model is dropped.
+
+    Every data table also feeds the model it belongs to. The bundle only says so
+    for tables whose fields a measure uses; the rest is implied by the FQN
+    (/sys/powerbi/<model>/<table>), and without it most tables would dead-end
+    before the model and its reports."""
+    links: set[tuple[str, str]] = set()
+    for key, kind in bi_kinds.items():
+        if kind == "bitable":
+            platform, model, _ = key.split(".", 2)
+            model_key = f"{platform}.{model}.{_BI_MODEL_TABLE}"
+            if bi_kinds.get(model_key) == "bimodel":
+                links.add((key, model_key))
+
+    needed = {"source_fqn", "source_type", "target_fqn", "target_type"}
+    if not needed <= set(edges_df.columns):
+        return links
+    bi = lambda col: edges_df[col].astype(str).str.lower().isin(_BI_ASSET_TYPES)  # noqa: E731
+    unmediated = edges_df["process_fqn"].isna() if "process_fqn" in edges_df.columns else True
+    rows = edges_df[unmediated & (bi("source_type") | bi("target_type"))]
+
+    for src, src_tag, tgt, tgt_tag in rows[["source_fqn", "source_type", "target_fqn", "target_type"]].dropna(subset=["source_fqn", "target_fqn"]).itertuples(index=False):
+        a, b = parse_asset(str(src), src_tag), parse_asset(str(tgt), tgt_tag)
+        if a["type"] in ("column", "table") and b["type"] in ("column", "table") and _table_key(a) != _table_key(b):
+            links.add((_table_key(a), _table_key(b)))
+    return links
 
 
 def _last_segment(fqn: str) -> str:
@@ -405,15 +570,33 @@ def get_flow_pairs(edges_df: pd.DataFrame) -> list[dict[str, Any]]:
     ]
 
 
-def _table_node(node_id: str, key: str, view_keys: set[str]) -> dict[str, Any]:
+_BI_LABEL_PREFIX = {"bimodel": "Model", "bireport": "Report", "bitile": "Tile"}
+
+
+def _bi_label(kind: str, key: str) -> str:
+    """Display name for a Power BI node. Models, reports and tiles are only known by
+    GUID, so they show the kind and the start of the GUID (the full key is the
+    node's tooltip); a data table shows its own name."""
+    parent, name = (key.split(".", 2) + ["", ""])[1:3]
+    if kind == "bitable":
+        return name
+    return f"{_BI_LABEL_PREFIX[kind]} {(parent if kind == 'bimodel' else name)[:8]}"
+
+
+def _table_node(node_id: str, key: str, view_keys: set[str], bi_kinds: dict[str, str] | None = None) -> dict[str, Any]:
     parts = key.split(".")
-    return {
+    node = {
         "id": node_id,
         "type": "table",
         "full_name": key,
         "label": parts[-1] if parts else key,
         "is_view": key in view_keys,
     }
+    kind = (bi_kinds or {}).get(key)
+    if kind:
+        node["asset_type"] = kind
+        node["label"] = _bi_label(kind, key)
+    return node
 
 
 def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None = None) -> dict[str, Any]:
@@ -428,6 +611,12 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
     bogus process node between the view and its sources, each source is linked
     straight to the view with a "direct" edge.
 
+    Power BI assets (tagged bimodel/bireport/bitile/bitable/bifield/bimeasure; see
+    parse_asset) are table nodes with an `asset_type`: fields roll up into their data
+    table and measures into their model. Their read links have no process, so they
+    are drawn as "uses" edges (upstream asset -> asset built on it), alongside the
+    ordinary input/output edges of the SQL processes that load the data tables.
+
     Stored procedures are assets of their own: each becomes a "stored_procedure"
     node that contains the processes it ran (a process node's `parent_id` is its
     procedure's node id, per the `contextualizes` edges), and a procedure that
@@ -437,6 +626,7 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
     """
     proc_inputs, proc_outputs = _process_io(edges_df)
     view_keys = _view_table_keys(edges_df)
+    bi_kinds = _bi_node_kinds(edges_df)
     sp_of_process, sp_calls = _stored_procedure_links(edges_df)
 
     proc_meta: dict[str, dict] = {}
@@ -460,7 +650,7 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
         if key not in table_ids:
             table_ids[key] = f"n{counter}"
             counter += 1
-            nodes.append(_table_node(table_ids[key], key, view_keys))
+            nodes.append(_table_node(table_ids[key], key, view_keys, bi_kinds))
         return table_ids[key]
 
     def get_sp_id(fqn: str) -> str:
@@ -468,14 +658,14 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
         if fqn not in sp_ids:
             sp_ids[fqn] = f"n{counter}"
             counter += 1
-            parsed = parse_fqn(fqn)
+            parsed = parse_asset(fqn)
             nodes.append({
                 "id": sp_ids[fqn],
                 "type": "stored_procedure",
                 "fqn": fqn,
                 # database.schema.name, like a table's full_name — a stable key for the UI.
                 "full_name": _table_key(parsed) if parsed["type"] in ("column", "table") else fqn,
-                "label": _last_segment(fqn),
+                "label": unquote(_last_segment(fqn)),
             })
         return sp_ids[fqn]
 
@@ -528,6 +718,10 @@ def get_lineage_graph(edges_df: pd.DataFrame, processes_df: pd.DataFrame | None 
     for caller, callee in sp_calls:
         add_edge(get_sp_id(caller), get_sp_id(callee), "calls")
 
+    # Power BI links with no process in between (model -> report, field -> measure, ...).
+    for src_key, tgt_key in sorted(_unmediated_bi_links(edges_df, bi_kinds)):
+        add_edge(get_table_id(src_key), get_table_id(tgt_key), "uses")
+
     return {"nodes": nodes, "edges": edges}
 
 
@@ -547,9 +741,12 @@ def get_mapping_graph(edges_df: pd.DataFrame) -> dict[str, Any]:
         return {"nodes": [], "edges": []}
 
     mapped = edges_df[edges_df["edge"].astype(str).str.lower() == "maps_to"]
+    for tag_col in ("source_type", "target_type"):
+        if tag_col not in mapped.columns:
+            mapped = mapped.assign(**{tag_col: None})
     pair_columns: dict[tuple[str, str], set[tuple[str, str]]] = {}
-    for row in mapped[["source_fqn", "target_fqn"]].dropna().itertuples(index=False):
-        src, tgt = parse_fqn(str(row.source_fqn)), parse_fqn(str(row.target_fqn))
+    for row in mapped[["source_fqn", "source_type", "target_fqn", "target_type"]].dropna(subset=["source_fqn", "target_fqn"]).itertuples(index=False):
+        src, tgt = parse_asset(str(row.source_fqn), row.source_type), parse_asset(str(row.target_fqn), row.target_type)
         if src["type"] not in ("column", "table") or tgt["type"] not in ("column", "table"):
             continue
         src_key, tgt_key = _table_key(src), _table_key(tgt)
@@ -560,13 +757,14 @@ def get_mapping_graph(edges_df: pd.DataFrame) -> dict[str, Any]:
             columns.add((src["column"], tgt["column"]))
 
     view_keys = _view_table_keys(edges_df)
+    bi_kinds = _bi_node_kinds(edges_df)
     table_ids: dict[str, str] = {}
     nodes: list[dict] = []
 
     def get_table_id(key: str) -> str:
         if key not in table_ids:
             table_ids[key] = f"n{len(table_ids)}"
-            nodes.append(_table_node(table_ids[key], key, view_keys))
+            nodes.append(_table_node(table_ids[key], key, view_keys, bi_kinds))
         return table_ids[key]
 
     edges = [

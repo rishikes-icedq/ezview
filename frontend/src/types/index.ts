@@ -58,6 +58,8 @@ export interface LineageSummary {
   source_type_distribution: Record<string, number>
   target_type_distribution: Record<string, number>
   query_type_distribution: Record<string, number>
+  /** Only for bundles with Power BI assets; the database counts above leave these out. */
+  bi_assets?: { models: number; reports: number; tiles: number; tables: number; fields: number; measures: number }
   manifest: Record<string, unknown> | null
 }
 
@@ -124,6 +126,8 @@ export interface ProcessRecord {
   last_seen_at: string
 }
 
+export type BiAssetType = 'bitable' | 'bimodel' | 'bireport' | 'bitile'
+
 export interface LineageGraphNode {
   id: string
   type: 'table' | 'process' | 'stored_procedure'
@@ -132,6 +136,11 @@ export interface LineageGraphNode {
   full_name?: string
   /** Table nodes only: the pipeline tags this object as a view rather than a table. */
   is_view?: boolean
+  /**
+   * Table nodes only, Power BI assets: a data table (`bitable`, its fields roll up into it), a model
+   * (`bimodel`, its measures roll up into it), a report or a dashboard tile. Absent for database objects.
+   */
+  asset_type?: BiAssetType
   process_fqn?: string
   process_type?: string | null
   query_type?: string | null
@@ -148,9 +157,10 @@ export interface LineageGraphEdge {
   /**
    * input = table→process (read), output = process→table (write), mapping = table/view→table/view via maps_to
    * (data-mapping mode), direct = the same maps_to link drawn inside the full graph for a view, which has no
-   * process to route through, calls = stored procedure → stored procedure it invokes.
+   * process to route through, calls = stored procedure → stored procedure it invokes, uses = Power BI asset →
+   * asset built on it (source table → model, data table → model, model → report/tile, report → tile).
    */
-  kind: 'input' | 'output' | 'mapping' | 'direct' | 'calls'
+  kind: 'input' | 'output' | 'mapping' | 'direct' | 'calls' | 'uses'
   /** Mapping edges only: how many column-to-column mappings back this link (0 = a table-level link only). */
   column_count?: number
 }

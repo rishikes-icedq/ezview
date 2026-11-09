@@ -11,6 +11,7 @@ from services.analysis_svc import (
     get_flow_pairs,
     get_lineage_graph,
     get_mapping_graph,
+    parse_asset,
     parse_fqn,
 )
 from tests.conftest import EDGES_ROWS, PROCESSES_ROWS
@@ -526,6 +527,146 @@ def test_stored_procedure_is_not_a_table():
     assert compute_summary(df, pd.DataFrame())["unique_tables"] == 5
     # flow pairs never treat the stored procedure as a source table either
     assert all("sp_load" not in p["source_table"] for p in get_flow_pairs(df))
+
+
+# ---------------------------------------------------------------------------
+# Power BI bundles
+# ---------------------------------------------------------------------------
+#
+# Power BI assets are /system/powerbi/<model|report|dashboard id>/…: their depth
+# collides with database objects (a field is as deep as a table, a measure as deep
+# as a schema), so only the endpoint's source_type/target_type tag tells them apart.
+
+PB = "/pbsys/powerbi"
+SQL = "/dbsys/sqlserver/ip/dbo"
+BI_PROC = "/dbsys/sqlserver/dataprocess/p1"   # newer bundles put the platform before "dataprocess"
+
+POWERBI_ROWS = [
+    # a SQL process loads the model's data table "Sales Data" from the physical table orders
+    _typed_row("read_by", f"{SQL}/orders/amount", BI_PROC, "column", "dataprocess", BI_PROC),
+    _typed_row("read_by", f"{SQL}/orders", BI_PROC, "table", "dataprocess", BI_PROC),
+    _typed_row("writes_to", BI_PROC, f"{PB}/m1/Sales%20Data/Amount", "dataprocess", "bifield", BI_PROC),
+    _typed_row("writes_to", BI_PROC, f"{PB}/m1/Sales%20Data", "dataprocess", "bitable", BI_PROC),
+    _typed_row("maps_to", f"{SQL}/orders/amount", f"{PB}/m1/Sales%20Data/Amount", "column", "bifield", BI_PROC),
+    _typed_row("maps_to", f"{SQL}/orders", f"{PB}/m1/Sales%20Data", "table", "bitable", BI_PROC),
+    # no process in between from here on
+    _typed_row("read_by", f"{PB}/m1/Sales%20Data/Amount", f"{PB}/m1/Total%20Amount", "bifield", "bimeasure", None),
+    _typed_row("read_by", f"{PB}/m1/Total%20Amount", f"{PB}/m1/Other", "bimeasure", "bimeasure", None),   # inside one model
+    _typed_row("read_by", f"{SQL}/orders", f"{PB}/m1", "table", "bimodel", None),
+    _typed_row("read_by", f"{PB}/m1", f"{PB}/r1", "bimodel", "bireport", None),
+    _typed_row("read_by", f"{PB}/m1", f"{PB}/d1/t1", "bimodel", "bitile", None),
+    _typed_row("read_by", f"{PB}/r1", f"{PB}/d1/t1", "bireport", "bitile", None),
+    # a second model with a data table that no measure reads
+    _typed_row("writes_to", BI_PROC, f"{PB}/m2/Lonely", "dataprocess", "bitable", BI_PROC),
+    _typed_row("read_by", f"{SQL}/orders", f"{PB}/m2", "table", "bimodel", None),
+]
+
+
+def test_parse_asset_reads_power_bi_endpoints_by_their_type_tag():
+    field = parse_asset(f"{PB}/m1/Sales%20Data/Amount", "bifield")
+    assert (field["type"], field["asset_type"]) == ("column", "bitable")
+    assert (field["database"], field["schema"], field["table"], field["column"]) == ("powerbi", "m1", "Sales Data", "Amount")   # %20 decoded
+
+    measure = parse_asset(f"{PB}/m1/Total%20Amount", "bimeasure")
+    assert (measure["type"], measure["asset_type"], measure["table"], measure["column"]) == ("column", "bimodel", "(model)", "Total Amount")
+    assert parse_asset(f"{PB}/m1", "bimodel")["table"] == "(model)"      # a model is the table its measures are columns of
+    assert parse_asset(f"{PB}/r1", "bireport")["schema"] == "(reports)"
+    tile = parse_asset(f"{PB}/d1/t1", "bitile")
+    assert (tile["asset_type"], tile["schema"], tile["table"]) == ("bitile", "d1", "t1")
+    assert parse_asset(f"{PB}/m1/Sales%20Data", "bitable")["asset_type"] == "bitable"
+
+    # the same FQN without the tag is read by depth, as any database object
+    assert parse_asset(f"{PB}/m1/Sales%20Data/Amount")["type"] == "table"
+    assert "asset_type" not in parse_asset(f"{PB}/m1/Sales%20Data/Amount")
+    # a tag whose FQN has the wrong depth does not resolve
+    assert parse_asset(f"{PB}/m1", "bifield")["type"] == "unresolved"
+
+
+def test_parse_fqn_dataprocess_with_platform_segment():
+    r = parse_fqn(BI_PROC)
+    assert (r["type"], r["system"], r["platform"], r["process_id"]) == ("dataprocess", "dbsys", "sqlserver", "p1")
+
+
+def test_power_bi_graph_chains_source_table_to_report():
+    graph = get_lineage_graph(pd.DataFrame(POWERBI_ROWS), None)
+    nodes = {n["id"]: n for n in graph["nodes"]}
+    name = {i: n.get("full_name") or n["process_fqn"] for i, n in nodes.items()}
+    links = {(name[e["source"]], name[e["target"]], e["kind"]) for e in graph["edges"]}
+
+    # a field is not a table of its own: it rolls up into its data table, a measure into its model
+    assert {n["full_name"] for n in graph["nodes"] if n["type"] == "table"} == {
+        "ip.dbo.orders",
+        "powerbi.m1.Sales Data", "powerbi.m1.(model)", "powerbi.(reports).r1", "powerbi.d1.t1",
+        "powerbi.m2.Lonely", "powerbi.m2.(model)",
+    }
+    assert links == {
+        # the SQL process that loads the data table keeps its read/write edges
+        ("ip.dbo.orders", BI_PROC, "input"),
+        (BI_PROC, "powerbi.m1.Sales Data", "output"),
+        (BI_PROC, "powerbi.m2.Lonely", "output"),
+        # everything without a process: "used by" edges
+        ("powerbi.m1.Sales Data", "powerbi.m1.(model)", "uses"),   # a measure reads its fields (one edge for every field)
+        ("ip.dbo.orders", "powerbi.m1.(model)", "uses"),
+        ("powerbi.m1.(model)", "powerbi.(reports).r1", "uses"),
+        ("powerbi.m1.(model)", "powerbi.d1.t1", "uses"),
+        ("powerbi.(reports).r1", "powerbi.d1.t1", "uses"),
+        ("powerbi.m2.Lonely", "powerbi.m2.(model)", "uses"),       # implied by the FQN: no measure reads it
+        ("ip.dbo.orders", "powerbi.m2.(model)", "uses"),
+    }
+    # (measure -> measure inside one model, and field -> measure's table == model, add no self-loop)
+    assert all(name[e["source"]] != name[e["target"]] for e in graph["edges"])
+
+
+def test_power_bi_nodes_carry_their_asset_type_and_a_readable_label():
+    nodes = {n["full_name"]: n for n in get_lineage_graph(pd.DataFrame(POWERBI_ROWS), None)["nodes"] if n["type"] == "table"}
+    assert nodes["powerbi.m1.Sales Data"]["asset_type"] == "bitable" and nodes["powerbi.m1.Sales Data"]["label"] == "Sales Data"
+    # models, reports and tiles only have GUIDs: show the kind and the start of the id
+    assert (nodes["powerbi.m1.(model)"]["asset_type"], nodes["powerbi.m1.(model)"]["label"]) == ("bimodel", "Model m1")
+    assert (nodes["powerbi.(reports).r1"]["asset_type"], nodes["powerbi.(reports).r1"]["label"]) == ("bireport", "Report r1")
+    assert (nodes["powerbi.d1.t1"]["asset_type"], nodes["powerbi.d1.t1"]["label"]) == ("bitile", "Tile t1")
+    assert "asset_type" not in nodes["ip.dbo.orders"]
+
+
+def test_power_bi_summary_counts_bi_assets_apart_from_databases():
+    s = compute_summary(pd.DataFrame(POWERBI_ROWS), pd.DataFrame([{"process_fqn": BI_PROC}]))
+    # one physical table and column; the model ids, data tables and fields are not databases/schemas/tables
+    assert (s["unique_databases"], s["unique_schemas"], s["unique_tables"], s["unique_columns"]) == (1, 1, 1, 1)
+    assert s["bi_assets"] == {"models": 2, "reports": 1, "tiles": 1, "tables": 2, "fields": 1, "measures": 2}
+    assert {"pbsys", "dbsys"} <= set(s["system_names"])
+
+
+def test_summary_has_no_bi_assets_for_a_database_bundle():
+    assert "bi_assets" not in compute_summary(pd.DataFrame(NO_PROCESS_VIEW_ROWS), pd.DataFrame())
+
+
+def test_power_bi_assets_tree_groups_fields_under_their_data_table():
+    tree = {d["database"]: d for d in build_asset_tree(pd.DataFrame(POWERBI_ROWS))}
+    assert set(tree) == {"ip", "powerbi"}
+    model = {t["table"]: t for t in {s["schema"]: s for s in tree["powerbi"]["schemas"]}["m1"]["tables"]}
+    assert model["Sales Data"]["columns"] == ["Amount"]                  # the field, not a table named "Amount"
+    assert model["(model)"]["columns"] == ["Other", "Total Amount"]      # a model's columns are its measures
+    assert {s["schema"] for s in tree["powerbi"]["schemas"]} == {"m1", "m2", "(reports)", "d1"}
+
+
+def test_power_bi_data_mapping_links_source_table_to_data_table():
+    graph = get_mapping_graph(pd.DataFrame(POWERBI_ROWS))
+    name = {n["id"]: n["full_name"] for n in graph["nodes"]}
+    assert {(name[e["source"]], name[e["target"]], e["column_count"]) for e in graph["edges"]} == {
+        ("ip.dbo.orders", "powerbi.m1.Sales Data", 1),
+    }
+    assert next(n for n in graph["nodes"] if n["full_name"] == "powerbi.m1.Sales Data")["asset_type"] == "bitable"
+
+
+def test_power_bi_flow_pairs_go_from_the_source_table_to_the_data_table():
+    pairs = {(p["source_table"], p["target_table"]) for p in get_flow_pairs(pd.DataFrame(POWERBI_ROWS))}
+    assert pairs == {("ip.dbo.orders", "powerbi.m1.Sales Data"), ("ip.dbo.orders", "powerbi.m2.Lonely")}
+
+
+def test_percent_encoded_names_are_shown_decoded():
+    rows = _io_rows(_proc("p1"), "Dim%20-%20Date", "out")
+    nodes = {n["full_name"] for n in get_lineage_graph(pd.DataFrame(rows), None)["nodes"] if n["type"] == "table"}
+    assert nodes == {"db1.schema1.Dim - Date", "db1.schema1.out"}
+    assert "Dim - Date" in {t["table"] for d in build_asset_tree(pd.DataFrame(rows)) for s in d["schemas"] for t in s["tables"]}
 
 
 # ---------------------------------------------------------------------------

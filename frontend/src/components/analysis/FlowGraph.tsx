@@ -5,13 +5,13 @@ import {
   type Node, type Edge, type NodeProps, type ReactFlowInstance,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { Loader2, Table2, Layers, Cpu, Boxes, ChevronDown, ChevronUp, Crosshair, RotateCcw, MousePointerClick } from 'lucide-react'
+import { Loader2, Table2, Layers, Cpu, Boxes, Box, Sheet, BarChart3, LayoutDashboard, ChevronDown, ChevronUp, Crosshair, RotateCcw, MousePointerClick, type LucideIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import { getGraph } from '../../api/lineage'
 import { useTheme } from '../../contexts/ThemeContext'
 import { focusLineage, type FocusScope } from '../../utils/lineageFocus'
 import { layoutLineage, EDGE_COLOR, TABLE_WIDTH, TABLE_HEIGHT, PROCESS_WIDTH, PROCESS_HEIGHT, SP_HEADER_HEIGHT } from './flowLayout'
-import type { GraphMode, LineageGraph } from '../../types'
+import type { BiAssetType, GraphMode, LineageGraph } from '../../types'
 
 interface Props {
   folder: string
@@ -25,7 +25,7 @@ interface Props {
 }
 
 const MODE_OPTIONS: { id: GraphMode; label: string; hint: string }[] = [
-  { id: 'all', label: 'All', hint: 'Tables and views together with the processes that read and write them. Processes run by a stored procedure sit inside its yellow box (click the arrow to open it); a procedure that calls another is linked to it (yellow). A view has no process, so it is linked straight to what it maps from (pink).' },
+  { id: 'all', label: 'All', hint: 'Tables and views together with the processes that read and write them. Processes run by a stored procedure sit inside its yellow box (click the arrow to open it); a procedure that calls another is linked to it (yellow). A view has no process, so it is linked straight to what it maps from (pink). Power BI models, reports and tiles have no process either: they are linked to what they are built on (blue), and a data table with a SQL process in front of it also shows that process.' },
   { id: 'mapping', label: 'Data Mapping', hint: 'Only table/view → table/view links from maps_to edges, with no processes in between. Edge labels show how many columns are mapped.' },
 ]
 
@@ -100,16 +100,48 @@ const VIEW_NODE_COLOR = 'bg-fuchsia-100 border-fuchsia-400 text-fuchsia-900 dark
 // Same hue as EDGE_COLOR.calls. Translucent so the edges that pass behind an expanded box stay visible.
 const STORED_PROCEDURE_COLOR = 'bg-yellow-100/80 border-yellow-500 text-yellow-900 dark:bg-yellow-900/30 dark:border-yellow-600 dark:text-yellow-100'
 
-function TableNode({ data }: NodeProps<Node<{ label: string; fullName?: string; focused?: boolean; isView?: boolean }>>) {
-  const kind = data.isView ? 'View' : 'Table'
+// Power BI assets. Hues are picked to stay clear of table (cyan), view (fuchsia) and stored procedure (yellow).
+const BI_NODE_STYLE: Record<BiAssetType, { name: string; color: string; Icon: LucideIcon; hint: string }> = {
+  bitable: {
+    name: 'Data table',
+    color: 'bg-lime-100 border-lime-500 text-lime-900 dark:bg-lime-900/40 dark:border-lime-600 dark:text-lime-100',
+    Icon: Sheet,
+    hint: 'a table inside a Power BI model (its fields are rolled up into it)',
+  },
+  bimodel: {
+    name: 'Model',
+    color: 'bg-violet-100 border-violet-400 text-violet-900 dark:bg-violet-900/50 dark:border-violet-600 dark:text-violet-100',
+    Icon: Box,
+    hint: 'a Power BI semantic model (its measures are rolled up into it)',
+  },
+  bireport: {
+    name: 'Report',
+    color: 'bg-orange-100 border-orange-400 text-orange-900 dark:bg-orange-900/40 dark:border-orange-600 dark:text-orange-100',
+    Icon: BarChart3,
+    hint: 'a Power BI report',
+  },
+  bitile: {
+    name: 'Tile',
+    color: 'bg-emerald-100 border-emerald-500 text-emerald-900 dark:bg-emerald-900/40 dark:border-emerald-600 dark:text-emerald-100',
+    Icon: LayoutDashboard,
+    hint: 'a Power BI dashboard tile',
+  },
+}
+const BI_ASSET_ORDER: BiAssetType[] = ['bitable', 'bimodel', 'bireport', 'bitile']
+
+function TableNode({ data }: NodeProps<Node<{ label: string; fullName?: string; focused?: boolean; isView?: boolean; assetType?: BiAssetType }>>) {
+  const bi = data.assetType ? BI_NODE_STYLE[data.assetType] : undefined
+  const kind = bi ? bi.name : data.isView ? 'View' : 'Table'
+  const color = bi ? bi.color : data.isView ? VIEW_NODE_COLOR : TABLE_NODE_COLOR
+  const Icon = bi ? bi.Icon : data.isView ? Layers : Table2
   return (
     <div
       title={data.focused ? `${data.fullName} (${kind.toLowerCase()})` : `${data.fullName} (${kind.toLowerCase()})\nClick to view only this asset's lineage`}
-      className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border-2 shadow-sm cursor-pointer ${data.isView ? VIEW_NODE_COLOR : TABLE_NODE_COLOR} ${data.focused ? 'ring-2 ring-amber-400' : ''}`}
+      className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border-2 shadow-sm cursor-pointer ${color} ${data.focused ? 'ring-2 ring-amber-400' : ''}`}
       style={{ width: TABLE_WIDTH, height: TABLE_HEIGHT }}
     >
       <Handle type="target" position={Position.Left} />
-      {data.isView ? <Layers size={14} className="shrink-0" /> : <Table2 size={14} className="shrink-0" />}
+      <Icon size={14} className="shrink-0" />
       <span className="font-mono text-xs font-medium truncate">{data.label}</span>
       <Handle type="source" position={Position.Right} />
     </div>
@@ -220,18 +252,26 @@ const NODE_TYPES = { table: TableNode, process: ProcessNode, stored_procedure: S
 
 const plural = (n: number, singular: string, pluralForm = `${singular}s`) => `${n} ${n === 1 ? singular : pluralForm}`
 
-function Legend({ hasViews, hasDirect, hasStoredProcedures, hasCalls, mode }: {
+function Legend({ hasViews, biAssets, hasDirect, hasStoredProcedures, hasCalls, hasUses, mode }: {
   hasViews: boolean
+  /** Power BI kinds present in the graph. */
+  biAssets: ReadonlySet<BiAssetType>
   hasDirect: boolean
   hasStoredProcedures: boolean
   hasCalls: boolean
+  hasUses: boolean
   mode: GraphMode
 }) {
   const swatch = 'inline-block w-3.5 h-3.5 rounded border-2'
   return (
-    <div className="flex items-center gap-3 px-2.5 py-1.5 rounded-md border border-slate-200 dark:border-slate-700 bg-white/90 dark:bg-slate-900/90 text-[11px] text-slate-600 dark:text-slate-300 shadow-sm">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-2.5 py-1.5 rounded-md border border-slate-200 dark:border-slate-700 bg-white/90 dark:bg-slate-900/90 text-[11px] text-slate-600 dark:text-slate-300 shadow-sm">
       <span className="flex items-center gap-1.5"><span className={`${swatch} ${TABLE_NODE_COLOR}`} />Table</span>
       {hasViews && <span className="flex items-center gap-1.5"><span className={`${swatch} ${VIEW_NODE_COLOR}`} />View</span>}
+      {BI_ASSET_ORDER.filter(k => biAssets.has(k)).map(k => (
+        <span key={k} className="flex items-center gap-1.5" title={`Power BI: ${BI_NODE_STYLE[k].hint}`}>
+          <span className={`${swatch} ${BI_NODE_STYLE[k].color}`} />{BI_NODE_STYLE[k].name}
+        </span>
+      ))}
       {hasStoredProcedures && (
         <span className="flex items-center gap-1.5" title="Stored procedure: holds the processes it ran. Click its arrow to show or hide them.">
           <span className={`${swatch} ${STORED_PROCEDURE_COLOR}`} />Stored procedure
@@ -262,6 +302,12 @@ function Legend({ hasViews, hasDirect, hasStoredProcedures, hasCalls, mode }: {
             <span className="flex items-center gap-1.5" title="Stored procedure → stored procedure: the first one calls the second">
               <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.calls} strokeWidth="2" /></svg>
               calls
+            </span>
+          )}
+          {hasUses && (
+            <span className="flex items-center gap-1.5" title="Power BI: the asset on the right is built on the one on the left (source table → model, data table → model, model → report or tile, report → tile)">
+              <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.uses} strokeWidth="2" /></svg>
+              used by
             </span>
           )}
         </>
@@ -364,9 +410,11 @@ function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableCl
       <Panel position="top-left">
         <Legend
           hasViews={initialNodes.some(n => n.data.isView)}
+          biAssets={new Set(initialNodes.flatMap(n => (n.data.assetType ? [n.data.assetType as BiAssetType] : [])))}
           hasDirect={initialEdges.some(e => e.data?.kind === 'direct')}
           hasStoredProcedures={initialNodes.some(n => n.type === 'stored_procedure')}
           hasCalls={initialEdges.some(e => e.data?.kind === 'calls')}
+          hasUses={initialEdges.some(e => e.data?.kind === 'uses')}
           mode={mode}
         />
       </Panel>
