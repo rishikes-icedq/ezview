@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Loader2, BarChart3, Database, GitBranch, Cpu, Network, FolderTree } from 'lucide-react'
 import { getSummary } from '../../api/lineage'
 import type { GraphMode, LineageSummary } from '../../types'
@@ -9,6 +9,7 @@ import EdgeTable from './EdgeTable'
 import ProcessList from './ProcessList'
 import FlowGraph from './FlowGraph'
 import OkfCatalog from './OkfCatalog'
+import BiNamesBar from './BiNamesBar'
 
 type Tab = 'summary' | 'assets' | 'edges' | 'processes' | 'flow' | 'catalog'
 
@@ -25,15 +26,20 @@ interface Props {
   folder: string
   /** Optional path label shown in header */
   label?: string
+  /** The Lineage graph fills the whole window: everything around it is hidden (not unmounted, so the graph keeps its state). */
+  maximized?: boolean
+  onMaximizedChange?: (maximized: boolean) => void
 }
 
-export default function LineageAnalysis({ folder, label }: Props) {
+export default function LineageAnalysis({ folder, label, maximized = false, onMaximizedChange }: Props) {
   const [summary, setSummary] = useState<LineageSummary | null>(null)
   const [tab, setTab] = useState<Tab>('summary')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   // `database.schema.table` the Lineage tab is narrowed to, or null for the whole graph.
   const [focusTable, setFocusTable] = useState<string | null>(null)
+  // Power BI crawl folder chosen by hand, or null to look for it next to the bundle. Belongs to one bundle.
+  const [crawl, setCrawl] = useState<string | null>(null)
   // Preferences, so unlike focusTable they survive switching folders.
   const [focusScope, setFocusScope] = useState<FocusScope>('full')
   const [graphMode, setGraphMode] = useState<GraphMode>('all')
@@ -47,18 +53,24 @@ export default function LineageAnalysis({ folder, label }: Props) {
     setLoading(true)
     setError(null)
     setFocusTable(null)
+    setCrawl(null)
     getSummary(folder)
       .then(setSummary)
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
   }, [folder])
 
+  // Never leave the app maximized (with its header and sidebar hidden) once this view is gone.
+  const onMaximizedChangeRef = useRef(onMaximizedChange)
+  onMaximizedChangeRef.current = onMaximizedChange
+  useEffect(() => () => onMaximizedChangeRef.current?.(false), [])
+
   const displayName = label ?? folder.split(/[\\/]/).pop() ?? folder
 
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="px-5 pt-5 pb-0 shrink-0">
+      <div className={`px-5 pt-5 pb-0 shrink-0 ${maximized ? 'hidden' : ''}`}>
         <div className="flex items-center gap-2 mb-4">
           <Network size={16} className="text-indigo-500 dark:text-indigo-400" />
           <span className="text-slate-800 dark:text-slate-200 font-semibold">{displayName}</span>
@@ -88,7 +100,13 @@ export default function LineageAnalysis({ folder, label }: Props) {
       </div>
 
       {/* Tab content */}
-      <div className="flex-1 overflow-y-auto p-5">
+      <div className={`flex-1 flex flex-col ${maximized ? 'overflow-hidden' : 'overflow-y-auto p-5'}`}>
+        {/* Where the model/report/tile names come from: only for a lineage with Power BI assets, on the tabs that show them */}
+        {summary?.bi_assets && (tab === 'flow' || tab === 'assets') && (
+          <div className={maximized ? 'hidden' : 'contents'}>
+            <BiNamesBar folder={folder} crawl={crawl} onCrawlChange={setCrawl} typeNames={summary.bi_asset_type_names} />
+          </div>
+        )}
         {loading ? (
           <div className="flex items-center gap-2 text-slate-500">
             <Loader2 size={16} className="animate-spin" /> Analysing…
@@ -98,10 +116,10 @@ export default function LineageAnalysis({ folder, label }: Props) {
         ) : summary ? (
           <>
             {tab === 'summary'   && <SummaryCards summary={summary} />}
-            {tab === 'assets'    && <AssetTree folder={folder} onViewLineage={viewLineage} />}
+            {tab === 'assets'    && <AssetTree folder={folder} crawl={crawl} onViewLineage={viewLineage} />}
             {tab === 'edges'     && <EdgeTable folder={folder} />}
             {tab === 'processes' && <ProcessList folder={folder} />}
-            {tab === 'flow'      && <FlowGraph folder={folder} focusTable={focusTable} onFocusChange={setFocusTable} focusScope={focusScope} onScopeChange={setFocusScope} graphMode={graphMode} onGraphModeChange={setGraphMode} />}
+            {tab === 'flow'      && <FlowGraph folder={folder} crawl={crawl} focusTable={focusTable} onFocusChange={setFocusTable} focusScope={focusScope} onScopeChange={setFocusScope} graphMode={graphMode} onGraphModeChange={setGraphMode} maximized={maximized} onMaximizedChange={onMaximizedChange} />}
             {tab === 'catalog'   && <OkfCatalog folder={folder} />}
           </>
         ) : null}

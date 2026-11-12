@@ -1,21 +1,31 @@
 import { useState, useEffect, useMemo } from 'react'
-import { Database, Table2, Columns, ChevronRight, ChevronDown, Loader2, ArrowUpRight, ArrowDownLeft, Network, Search, X } from 'lucide-react'
+import { Database, Table2, Columns, Columns3, Sigma, ChevronRight, ChevronDown, Loader2, ArrowUpRight, ArrowDownLeft, Network, Search, X } from 'lucide-react'
 import { getAssets } from '../../api/lineage'
 import type { AssetDatabase } from '../../types'
 
 interface Props {
   folder: string
+  /** Power BI crawl folder chosen by hand (for the names of models, reports, ...); null = the one next to the bundle. */
+  crawl?: string | null
   /** Called with the table's `database.schema.table` to show only its lineage. */
   onViewLineage: (fullName: string) => void
 }
 
-function Badge({ n, label }: { n: number; label: string }) {
+/** A Power BI asset known by id and, when the crawl names it, by name: shows the name with the id after it. */
+function NameWithId({ label, id }: { label?: string; id: string }) {
+  if (!label) return <>{id}</>
+  return <>{label} <span className="text-slate-500 dark:text-slate-500 font-normal text-xs">{id.length > 12 ? `${id.slice(0, 8)}…` : id}</span></>
+}
+
+/** "3 cols", or, for a name the data gives (`named`), "bifield (3)": a data name is shown as it is, never made into a plural. */
+function Badge({ n, label, hideZero = false, named = false }: { n: number; label: string; hideZero?: boolean; named?: boolean }) {
+  if (hideZero && n === 0) return null
   return (
-    <span className="ml-1.5 text-xs text-slate-500 tabular-nums">{n} {label}{n !== 1 ? 's' : ''}</span>
+    <span className="ml-1.5 text-xs text-slate-500 tabular-nums">{named ? `${label} (${n})` : `${n} ${label}${n !== 1 ? 's' : ''}`}</span>
   )
 }
 
-export default function AssetTree({ folder, onViewLineage }: Props) {
+export default function AssetTree({ folder, crawl = null, onViewLineage }: Props) {
   const [data, setData] = useState<AssetDatabase[]>([])
   const [loading, setLoading] = useState(true)
   const [openDbs, setOpenDbs] = useState<Set<string>>(new Set())
@@ -25,14 +35,18 @@ export default function AssetTree({ folder, onViewLineage }: Props) {
 
   useEffect(() => {
     setLoading(true)
-    getAssets(folder).then(d => {
+    let cancelled = false
+    getAssets(folder, crawl).then(d => {
+      if (cancelled) return
       setData(d)
       if (d.length === 1) setOpenDbs(new Set([d[0].database]))
-    }).finally(() => setLoading(false))
-  }, [folder])
+    }).finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [folder, crawl])
 
   // Every whitespace-separated term must appear somewhere in `database.schema.table`
   // (case-insensitive), so "sales" finds tables by name and "mydb.public" narrows by schema.
+  // A Power BI asset's name from the crawl counts too, so it can be found by name as well as by id.
   const terms = useMemo(() => query.trim().toLowerCase().split(/\s+/).filter(Boolean), [query])
   const searching = terms.length > 0
 
@@ -41,7 +55,7 @@ export default function AssetTree({ folder, onViewLineage }: Props) {
     return data.flatMap(db => {
       const schemas = db.schemas.flatMap(s => {
         const tables = s.tables.filter(t => {
-          const key = `${db.database}.${s.schema}.${t.table}`.toLowerCase()
+          const key = `${db.database}.${s.schema}.${t.table} ${s.schema_label ?? ''} ${t.table_label ?? ''}`.toLowerCase()
           return terms.every(term => key.includes(term))
         })
         return tables.length ? [{ ...s, table_count: tables.length, tables }] : []
@@ -126,7 +140,9 @@ export default function AssetTree({ folder, onViewLineage }: Props) {
                         >
                           {schemaOpen ? <ChevronDown size={12} className="text-slate-400 dark:text-slate-600 shrink-0" /> : <ChevronRight size={12} className="text-slate-400 dark:text-slate-600 shrink-0" />}
                           <span className="text-xs text-slate-500 font-mono uppercase tracking-wider">Schema</span>
-                          <span className="font-medium text-green-700 dark:text-green-300 font-mono">{schema.schema}</span>
+                          <span className="font-medium text-green-700 dark:text-green-300 font-mono" title={schema.schema_label ? schema.schema : undefined}>
+                            <NameWithId label={schema.schema_label} id={schema.schema} />
+                          </span>
                           <Badge n={schema.table_count} label="table" />
                         </button>
 
@@ -143,8 +159,18 @@ export default function AssetTree({ folder, onViewLineage }: Props) {
                                 >
                                   {tableOpen ? <ChevronDown size={11} className="text-slate-400 dark:text-slate-600 shrink-0" /> : <ChevronRight size={11} className="text-slate-400 dark:text-slate-600 shrink-0" />}
                                   <Table2 size={12} className="text-cyan-700 dark:text-cyan-400 shrink-0" />
-                                  <span className="font-mono text-cyan-700 dark:text-cyan-300">{table.table}</span>
-                                  <Badge n={table.column_count} label="col" />
+                                  <span className="font-mono text-cyan-700 dark:text-cyan-300" title={table.table_label ? table.table : undefined}>
+                                    <NameWithId label={table.table_label} id={table.table} />
+                                  </span>
+                                  {table.column_kinds ? (
+                                    // A model: what it holds is fields and measures (as the data names them), not "columns".
+                                    <>
+                                      {table.type_names?.field && <Badge n={Object.values(table.column_kinds).filter(k => k === 'field').length} label={table.type_names.field} hideZero named />}
+                                      {table.type_names?.measure && <Badge n={Object.values(table.column_kinds).filter(k => k === 'measure').length} label={table.type_names.measure} hideZero named />}
+                                    </>
+                                  ) : (
+                                    <Badge n={table.column_count} label="col" />
+                                  )}
                                   {table.source_process_count > 0 && (
                                     <span
                                       className="ml-auto flex items-center gap-0.5 text-xs text-emerald-600 dark:text-emerald-500 cursor-help"
@@ -165,7 +191,7 @@ export default function AssetTree({ folder, onViewLineage }: Props) {
                                 <button
                                   onClick={() => onViewLineage(tk)}
                                   title="View lineage for this asset only"
-                                  aria-label={`View lineage for ${table.table}`}
+                                  aria-label={`View lineage for ${table.table_label ?? table.table}`}
                                   className="shrink-0 mx-3 p-1 rounded text-slate-400 dark:text-slate-500 hover:text-indigo-600 dark:hover:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-indigo-900/40 transition-colors"
                                 >
                                   <Network size={14} />
@@ -174,11 +200,21 @@ export default function AssetTree({ folder, onViewLineage }: Props) {
 
                               {tableOpen && table.columns.length > 0 && (
                                 <div className="px-14 py-2 bg-slate-50 dark:bg-slate-900/40 border-b border-slate-100 dark:border-slate-800/30 flex flex-wrap gap-1.5">
-                                  {table.columns.map(col => (
-                                    <span key={col} className="font-mono text-xs text-purple-700 dark:text-purple-300 bg-purple-100/60 dark:bg-purple-900/20 border border-purple-300 dark:border-purple-800/40 px-1.5 py-0.5 rounded">
-                                      {col}
-                                    </span>
-                                  ))}
+                                  {table.columns.map(col => {
+                                    const kind = table.column_kinds?.[col]
+                                    const label = table.column_labels?.[col] ?? col
+                                    return (
+                                      <span
+                                        key={col}
+                                        title={kind ? `${label} (${table.type_names?.[kind] ?? kind})${label !== col ? ` — id: ${col}` : ''}` : undefined}
+                                        className="inline-flex items-center gap-1 font-mono text-xs text-purple-700 dark:text-purple-300 bg-purple-100/60 dark:bg-purple-900/20 border border-purple-300 dark:border-purple-800/40 px-1.5 py-0.5 rounded"
+                                      >
+                                        {kind === 'field' && <Columns3 size={10} className="shrink-0" aria-label={table.type_names?.field} />}
+                                        {kind === 'measure' && <Sigma size={10} className="shrink-0" aria-label={table.type_names?.measure} />}
+                                        {label}
+                                      </span>
+                                    )
+                                  })}
                                 </div>
                               )}
                             </div>

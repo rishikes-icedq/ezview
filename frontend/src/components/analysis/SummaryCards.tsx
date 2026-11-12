@@ -1,5 +1,5 @@
 import type { LineageSummary } from '../../types'
-import { Database, Table2, Columns, GitBranch, Activity, Layers, Box, BarChart3, LayoutDashboard, Sheet, Sigma } from 'lucide-react'
+import { Database, Table2, Columns, GitBranch, Activity, Layers, Box, BarChart3, LayoutDashboard, PanelTop, Sheet, Sigma, Workflow } from 'lucide-react'
 
 interface Props { summary: LineageSummary }
 
@@ -58,15 +58,22 @@ export default function SummaryCards({ summary }: Props) {
         <StatCard icon={<Columns size={14} />} label="Columns" value={summary.unique_columns} />
       </div>
 
-      {/* Power BI assets: not database objects, so they are not in the counts above */}
+      {/* Power BI assets: not database objects, so they are not in the counts above. Kinds the bundle has none of are left out. */}
       {summary.bi_assets && (
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3" aria-label="Power BI assets">
-          <StatCard icon={<Box size={14} />} label="BI models" value={summary.bi_assets.models} />
-          <StatCard icon={<BarChart3 size={14} />} label="BI reports" value={summary.bi_assets.reports} />
-          <StatCard icon={<LayoutDashboard size={14} />} label="BI tiles" value={summary.bi_assets.tiles} />
-          <StatCard icon={<Sheet size={14} />} label="BI tables" value={summary.bi_assets.tables} />
-          <StatCard icon={<Columns size={14} />} label="BI fields" value={summary.bi_assets.fields} />
-          <StatCard icon={<Sigma size={14} />} label="BI measures" value={summary.bi_assets.measures} />
+          {/* Each card is labelled with what the data calls the kind (a path's kind segment, or the source_type/target_type tag). */}
+          {([
+            [<Box size={14} />, 'models', summary.bi_assets.models],
+            [<BarChart3 size={14} />, 'reports', summary.bi_assets.reports],
+            [<PanelTop size={14} />, 'dashboards', summary.bi_assets.dashboards],
+            [<LayoutDashboard size={14} />, 'tiles', summary.bi_assets.tiles],
+            [<Workflow size={14} />, 'dataflows', summary.bi_assets.dataflows],
+            [<Sheet size={14} />, 'tables', summary.bi_assets.tables],
+            [<Columns size={14} />, 'fields', summary.bi_assets.fields],
+            [<Sigma size={14} />, 'measures', summary.bi_assets.measures],
+          ] as [React.ReactNode, keyof NonNullable<LineageSummary['bi_asset_type_names']>, number | undefined][])
+            .filter(([, key, n]) => n && summary.bi_asset_type_names?.[key])
+            .map(([icon, key, n]) => <StatCard key={key} icon={icon} label={summary.bi_asset_type_names![key]!} value={n as number} />)}
         </div>
       )}
 

@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { Toaster } from 'sonner'
 import Header from './components/layout/Header'
 import FileBrowser from './components/explorer/FileBrowser'
@@ -13,7 +13,9 @@ import SqlFormatterTool from './components/tools/SqlFormatterTool'
 import DiffTool from './components/tools/DiffTool'
 import SnippetsTool from './components/tools/snippets/SnippetsTool'
 import ColResizeHandle from './components/shared/ColResizeHandle'
+import SidebarToggle from './components/layout/SidebarToggle'
 import { useResizableColumns } from './hooks/useResizableColumns'
+import { usePersistentBoolean } from './hooks/usePersistentBoolean'
 import { useTheme } from './contexts/ThemeContext'
 import type { FileDetection, ViewMode } from './types'
 import { Eye } from 'lucide-react'
@@ -66,6 +68,23 @@ export default function App() {
     [SIDEBAR_INITIAL_WIDTH], SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH,
   )
   const { theme } = useTheme()
+  // Collapsed sidebar is remembered between visits. While it is being dragged wider or narrower the width animation
+  // is switched off, or the panel would trail the mouse.
+  const [sidebarCollapsed, setSidebarCollapsed] = usePersistentBoolean('ezview.sidebarCollapsed', false)
+  const [resizing, setResizing] = useState(false)
+  // The lineage graph fills the whole window (header, sidebar and the rest of the lineage view are hidden).
+  const [lineageMaximized, setLineageMaximized] = useState(false)
+
+  // Ctrl/Cmd + \ toggles the sidebar (as in Notion). Not Ctrl+B: the Markdown editor uses that for bold.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== '\\' || !(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return
+      e.preventDefault()
+      setSidebarCollapsed(c => !c)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [setSidebarCollapsed])
 
   const handleSelect = useCallback((path: string, type: 'file' | 'directory') => {
     setSelectedPath(path)
@@ -108,7 +127,7 @@ export default function App() {
       case 'view_json':
         return <JsonViewer path={path} />
       case 'analyze_lineage':
-        return <LineageAnalysis folder={folder!} label={label} />
+        return <LineageAnalysis folder={folder!} label={label} maximized={lineageMaximized} onMaximizedChange={setLineageMaximized} />
       case 'edit_markdown':
         return <MarkdownEditor path={path} />
       case 'view_text':
@@ -121,22 +140,47 @@ export default function App() {
   return (
     <div className="flex flex-col h-screen overflow-hidden">
       <Toaster position="top-right" theme={theme} />
-      <Header
-        selectedPath={selectedPath}
-        onClear={handleClear}
-        activeTool={activeTool}
-        onSelectTool={setActiveTool}
-        onCloseTool={() => setActiveTool(null)}
-      />
+      {/* Hidden (not unmounted) while the lineage is maximized; `contents` keeps the layout identical otherwise. */}
+      <div className={lineageMaximized ? 'hidden' : 'contents'}>
+        <Header
+          selectedPath={selectedPath}
+          onClear={handleClear}
+          activeTool={activeTool}
+          onSelectTool={setActiveTool}
+          onCloseTool={() => setActiveTool(null)}
+        />
+      </div>
 
       <div className="flex flex-1 min-h-0">
-        {/* Sidebar */}
-        <div style={{ width: sidebarWidth }} className="relative shrink-0 flex flex-col bg-white dark:bg-slate-950 border-r border-slate-200 dark:border-slate-800">
-          <div className="flex-1 min-h-0">
-            <FileBrowser onSelect={handleSelect} selectedPath={selectedPath} />
-          </div>
-          <ActionBar selectedPath={selectedPath} onOpen={handleOpen} />
-          <ColResizeHandle onMouseDown={startResize(0)} />
+        {/* Sidebar. Collapsing animates its width to 0 but keeps it mounted, so the file tree keeps its state; the inner
+            panel keeps its width while the outer one shrinks, so its contents are clipped instead of re-wrapping. */}
+        <div className={`relative shrink-0 ${lineageMaximized ? 'hidden' : 'flex'}`}>
+          <aside
+            id="app-sidebar"
+            aria-label="File explorer"
+            style={{ width: sidebarCollapsed ? 0 : sidebarWidth }}
+            className={`flex flex-col overflow-hidden bg-white dark:bg-slate-950 border-r border-slate-200 dark:border-slate-800
+              ${resizing ? '' : 'transition-[width] duration-200 ease-out motion-reduce:transition-none'}`}
+          >
+            {/* `invisible` (applied once the animation ends) also takes the hidden controls out of the tab order. */}
+            <div
+              style={{ width: sidebarWidth - 1 }}
+              className={`relative flex-1 min-h-0 flex flex-col transition-[visibility] duration-200 motion-reduce:transition-none ${sidebarCollapsed ? 'invisible' : ''}`}
+            >
+              <div className="flex-1 min-h-0">
+                <FileBrowser onSelect={handleSelect} selectedPath={selectedPath} />
+              </div>
+              <ActionBar selectedPath={selectedPath} onOpen={handleOpen} />
+              <ColResizeHandle
+                onMouseDown={e => {
+                  setResizing(true)
+                  window.addEventListener('mouseup', () => setResizing(false), { once: true })
+                  startResize(0)(e)
+                }}
+              />
+            </div>
+          </aside>
+          <SidebarToggle collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(c => !c)} controls="app-sidebar" />
         </div>
 
         {/* Content pane */}

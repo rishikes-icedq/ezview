@@ -11,6 +11,11 @@ import type { LineageGraph, LineageGraphEdge } from '../types'
  * invokes which, not where data flows, so they are never walked. A procedure's
  * container is shown (and counts as on the chain) whenever one of its processes
  * is, and a `calls` edge is shown when both its procedures are.
+ *
+ * Likewise the tables, measures and fields of a Power BI model (`bi_member` nodes)
+ * are inside their model, not connected to it: they are shown whenever the model
+ * is, and the links that start or end at one of them are never walked as lineage
+ * (the link between the whole models, which they add up to, is).
  */
 export type FocusScope = 'direct' | 'full'
 
@@ -46,8 +51,12 @@ export function focusLineage(graph: LineageGraph, fullName: string, scope: Focus
     if (list) list.push(edgeIdx)
     else m.set(nodeId, [edgeIdx])
   }
+  const memberIds = new Set(graph.nodes.filter(n => n.type === 'bi_member').map(n => n.id))
+  // A link with a measure, field or table of a model at one end: between those inside one model, from a source table to
+  // a table of a model, or from a table of one model to a table of the next.
+  const isInnerEdge = (e: LineageGraphEdge) => memberIds.has(e.source) || memberIds.has(e.target)
   graph.edges.forEach((e, i) => {
-    if (e.kind === 'calls') return
+    if (e.kind === 'calls' || isInnerEdge(e)) return
     index(incoming, e.target, i)
     index(outgoing, e.source, i)
   })
@@ -97,14 +106,16 @@ export function focusLineage(graph: LineageGraph, fullName: string, scope: Focus
     }
   }
 
-  // Add the containers of the processes that made it in.
+  // Add the containers of the processes that made it in, and the fields/measures of the models that did.
   const parentOf = new Map(graph.nodes.map(n => [n.id, n.parent_id ?? null]))
+  const members = graph.nodes.filter(n => n.type === 'bi_member')
   const withContainers = (ids: Set<string>): Set<string> => {
     const all = new Set(ids)
     for (const id of ids) {
       const parent = parentOf.get(id)
       if (parent) all.add(parent)
     }
+    for (const m of members) if (m.parent_id && ids.has(m.parent_id)) all.add(m.id)
     return all
   }
   const pathNodeIds = withContainers(walked)
@@ -112,19 +123,21 @@ export function focusLineage(graph: LineageGraph, fullName: string, scope: Focus
 
   const nodes = graph.nodes.filter(n => shownNodeIds.has(n.id))
   const dataEdges = scope === 'full'
-    ? graph.edges.filter(e => e.kind !== 'calls' && shownNodeIds.has(e.source))
+    ? graph.edges.filter(e => e.kind !== 'calls' && !isInnerEdge(e) && shownNodeIds.has(e.source))
     : graph.edges.filter((_, i) => pathEdges.has(i))
   const callEdges = graph.edges.filter(e => e.kind === 'calls' && shownNodeIds.has(e.source) && shownNodeIds.has(e.target))
+  const memberEdges = graph.edges.filter(e => isInnerEdge(e) && shownNodeIds.has(e.source) && shownNodeIds.has(e.target))
 
   const tableCount = (ids: Set<string>) =>
     nodes.filter(n => n.type === 'table' && n.id !== start.id && ids.has(n.id)).length
 
   return {
-    graph: { nodes, edges: [...dataEdges, ...callEdges] },
+    graph: { nodes, edges: [...dataEdges, ...callEdges, ...memberEdges] },
     pathNodeIds,
     pathEdgeKeys: new Set([
       ...graph.edges.filter((_, i) => pathEdges.has(i)).map(edgeKey),
       ...callEdges.filter(e => pathNodeIds.has(e.source) && pathNodeIds.has(e.target)).map(edgeKey),
+      ...memberEdges.filter(e => pathNodeIds.has(e.source) && pathNodeIds.has(e.target)).map(edgeKey),
     ]),
     upstreamTables: tableCount(upstream),
     downstreamTables: tableCount(downstream),

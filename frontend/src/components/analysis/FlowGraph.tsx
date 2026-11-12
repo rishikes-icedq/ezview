@@ -1,20 +1,23 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactFlow, Background, Controls, MiniMap, Position, Handle, NodeToolbar, Panel,
-  useNodesState, useEdgesState,
-  type Node, type Edge, type NodeProps, type ReactFlowInstance,
+  useNodesState, useEdgesState, useReactFlow, useStore,
+  type Node, type Edge, type NodeProps, type ReactFlowInstance, type FitViewOptions,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { Loader2, Table2, Layers, Cpu, Boxes, Box, Sheet, BarChart3, LayoutDashboard, ChevronDown, ChevronUp, Crosshair, RotateCcw, MousePointerClick, type LucideIcon } from 'lucide-react'
+import { Loader2, Table2, Layers, Cpu, Boxes, Box, Sheet, BarChart3, LayoutDashboard, PanelTop, ChevronDown, ChevronUp, Crosshair, RotateCcw, MousePointerClick, Maximize2, Minimize2, Sigma, Columns3, Workflow, type LucideIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import { getGraph } from '../../api/lineage'
+import ColumnLineagePanel from './ColumnLineagePanel'
 import { useTheme } from '../../contexts/ThemeContext'
 import { focusLineage, type FocusScope } from '../../utils/lineageFocus'
-import { layoutLineage, EDGE_COLOR, TABLE_WIDTH, TABLE_HEIGHT, PROCESS_WIDTH, PROCESS_HEIGHT, SP_HEADER_HEIGHT } from './flowLayout'
+import { layoutLineage, EDGE_COLOR, TABLE_WIDTH, TABLE_HEIGHT, PROCESS_WIDTH, PROCESS_HEIGHT, SP_HEADER_HEIGHT, MEMBER_HEIGHT } from './flowLayout'
 import type { BiAssetType, GraphMode, LineageGraph } from '../../types'
 
 interface Props {
   folder: string
+  /** Power BI crawl folder chosen by hand (for names); null = the one found next to the bundle. */
+  crawl: string | null
   /** `database.schema.table` of the asset whose lineage alone is shown; null shows the whole graph. */
   focusTable: string | null
   onFocusChange: (fullName: string | null) => void
@@ -22,10 +25,13 @@ interface Props {
   onScopeChange: (scope: FocusScope) => void
   graphMode: GraphMode
   onGraphModeChange: (mode: GraphMode) => void
+  /** The graph fills the whole window and everything else (toolbars, tabs, header, sidebar) is hidden. Esc leaves it. */
+  maximized?: boolean
+  onMaximizedChange?: (maximized: boolean) => void
 }
 
 const MODE_OPTIONS: { id: GraphMode; label: string; hint: string }[] = [
-  { id: 'all', label: 'All', hint: 'Tables and views together with the processes that read and write them. Processes run by a stored procedure sit inside its yellow box (click the arrow to open it); a procedure that calls another is linked to it (yellow). A view has no process, so it is linked straight to what it maps from (pink). Power BI models, reports and tiles have no process either: they are linked to what they are built on (blue), and a data table with a SQL process in front of it also shows that process.' },
+  { id: 'all', label: 'All', hint: 'Tables and views together with the processes that read and write them. Processes run by a stored_procedure sit inside its yellow box (click the arrow to open it); one that calls another is linked to it (yellow). A view has no process, so it is linked straight to what it maps from (pink). Power BI: where the bundle has no process in between, what reads what is linked directly (read_by). A semantic_model has an arrow when the bundle says what is inside it: open it to see its semantic_tables and the fields and measures linked to each other. Click a semantic_table to see, field by field, where the fields come from and go.' },
   { id: 'mapping', label: 'Data Mapping', hint: 'Only table/view → table/view links from maps_to edges, with no processes in between. Edge labels show how many columns are mapped.' },
 ]
 
@@ -101,48 +107,205 @@ const VIEW_NODE_COLOR = 'bg-fuchsia-100 border-fuchsia-400 text-fuchsia-900 dark
 const STORED_PROCEDURE_COLOR = 'bg-yellow-100/80 border-yellow-500 text-yellow-900 dark:bg-yellow-900/30 dark:border-yellow-600 dark:text-yellow-100'
 
 // Power BI assets. Hues are picked to stay clear of table (cyan), view (fuchsia) and stored procedure (yellow).
-const BI_NODE_STYLE: Record<BiAssetType, { name: string; color: string; Icon: LucideIcon; hint: string }> = {
+// What each kind is CALLED on screen is not decided here: it is the name the data uses (a node's `type_name`: a path's kind segment
+// such as semantic_model, or the source_type/target_type tag such as bimodel).
+const BI_NODE_STYLE: Record<BiAssetType, { color: string; /** While open as a box around what it holds: translucent, so the links behind it show. */ openColor?: string; Icon: LucideIcon; hint?: string }> = {
   bitable: {
-    name: 'Data table',
     color: 'bg-lime-100 border-lime-500 text-lime-900 dark:bg-lime-900/40 dark:border-lime-600 dark:text-lime-100',
     Icon: Sheet,
-    hint: 'a table inside a Power BI model (its fields are rolled up into it)',
+    hint: 'its fields are rolled up into it',
   },
   bimodel: {
-    name: 'Model',
     color: 'bg-violet-100 border-violet-400 text-violet-900 dark:bg-violet-900/50 dark:border-violet-600 dark:text-violet-100',
+    openColor: 'bg-violet-100/60 border-violet-400 text-violet-900 dark:bg-violet-900/25 dark:border-violet-600 dark:text-violet-100',
     Icon: Box,
-    hint: 'a Power BI semantic model (its measures are rolled up into it)',
+    hint: 'its tables, measures and fields are rolled up into it; if it has an arrow, click it to open them',
   },
   bireport: {
-    name: 'Report',
     color: 'bg-orange-100 border-orange-400 text-orange-900 dark:bg-orange-900/40 dark:border-orange-600 dark:text-orange-100',
     Icon: BarChart3,
-    hint: 'a Power BI report',
   },
   bitile: {
-    name: 'Tile',
     color: 'bg-emerald-100 border-emerald-500 text-emerald-900 dark:bg-emerald-900/40 dark:border-emerald-600 dark:text-emerald-100',
     Icon: LayoutDashboard,
-    hint: 'a Power BI dashboard tile',
+  },
+  bidashboard: {
+    color: 'bg-pink-100 border-pink-400 text-pink-900 dark:bg-pink-900/40 dark:border-pink-600 dark:text-pink-100',
+    Icon: PanelTop,
+  },
+  bidataflow: {
+    color: 'bg-sky-100 border-sky-400 text-sky-900 dark:bg-sky-900/40 dark:border-sky-600 dark:text-sky-100',
+    Icon: Workflow,
   },
 }
-const BI_ASSET_ORDER: BiAssetType[] = ['bitable', 'bimodel', 'bireport', 'bitile']
+const BI_ASSET_ORDER: BiAssetType[] = ['bitable', 'bimodel', 'bireport', 'bitile', 'bidashboard', 'bidataflow']
 
-function TableNode({ data }: NodeProps<Node<{ label: string; fullName?: string; focused?: boolean; isView?: boolean; assetType?: BiAssetType }>>) {
+/** The table of a model whose column lineage is open (marked on the graph), or null. */
+const SelectedChipContext = createContext<{ modelId: string; table: string } | null>(null)
+
+/** Opens/closes a container box (a stored procedure, a Power BI model). Given by GraphCanvas, which also keeps the box where it was on screen. */
+const ContainerToggleContext = createContext<(nodeId: string, fullName: string) => void>(() => {})
+
+type TableNodeData = {
+  label: string
+  /** Node width: wider than the standard for a Power BI asset with a long name, or for a model's arrow. */
+  width?: number
+  /** Taller than a table when this is a model that is open, with its measures and fields inside. */
+  height?: number
+  fullName?: string
+  focused?: boolean
+  isView?: boolean
+  assetType?: BiAssetType
+  /** What the data calls this kind of asset (a Power BI node), shown under its name. */
+  typeName?: string
+  /** A model: what the data calls the tables, measures and fields in its box. */
+  insideTypeNames?: { table?: string; measure?: string; field?: string }
+  details?: { label: string; value: string }[]
+  /** A model that has tables, measures or fields to show: how many of each there are, and whether they are shown (in a box under the header). */
+  childCount?: number
+  tableCount?: number
+  measureCount?: number
+  fieldCount?: number
+  expanded?: boolean
+}
+
+const plural = (n: number, singular: string, pluralForm = `${singular}s`) => `${n} ${n === 1 ? singular : pluralForm}`
+
+/** What a model's box holds, for its tooltips, with the names the data uses: "semantic_table (24)", or "semantic_table (40), measure (53), field (2)". */
+function describeInside(data: Pick<TableNodeData, 'tableCount' | 'measureCount' | 'fieldCount' | 'insideTypeNames'>) {
+  const names = data.insideTypeNames
+  return ([['table', data.tableCount], ['measure', data.measureCount], ['field', data.fieldCount]] as const)
+    .flatMap(([kind, n]) => (n && names?.[kind] ? [`${names[kind]} (${n})`] : []))
+    .join(', ')
+}
+
+function TableNode({ id, data }: NodeProps<Node<TableNodeData>>) {
+  const toggle = useContext(ContainerToggleContext)
   const bi = data.assetType ? BI_NODE_STYLE[data.assetType] : undefined
-  const kind = bi ? bi.name : data.isView ? 'View' : 'Table'
-  const color = bi ? bi.color : data.isView ? VIEW_NODE_COLOR : TABLE_NODE_COLOR
+  // Named as the data names it: a Power BI asset by its own type_name, a database object by its tag.
+  const kind = bi ? data.typeName : data.isView ? 'view' : 'table'
+  const open = !!data.expanded
+  const color = bi ? (open && bi.openColor ? bi.openColor : bi.color) : data.isView ? VIEW_NODE_COLOR : TABLE_NODE_COLOR
   const Icon = bi ? bi.Icon : data.isView ? Layers : Table2
+  const inside = describeInside(data)
+  // A Power BI asset is shown by name with what it is underneath; its tooltip adds where it lives (workspace, ...)
+  // and, last, its full key. Database tables and views are shown by their key's last part, as before.
+  const tooltip = [
+    kind ? `${bi ? data.label : data.fullName} (${kind})` : (bi ? data.label : data.fullName),
+    ...(data.details ?? []).map(d => `${d.label}: ${d.value}`),
+    ...(bi ? [data.fullName] : []),
+    ...(data.childCount ? [`${inside ? `Has ${inside}: use` : 'Use'} the arrow to ${open ? 'hide' : 'show'} what is inside`] : []),
+    ...(data.focused ? [] : ["Click to view only this asset's lineage"]),
+  ].join('\n')
+  // Links to and from the model itself meet its header row, also while it is open and much taller than that.
+  const handleY = { top: TABLE_HEIGHT / 2 }
   return (
     <div
-      title={data.focused ? `${data.fullName} (${kind.toLowerCase()})` : `${data.fullName} (${kind.toLowerCase()})\nClick to view only this asset's lineage`}
-      className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border-2 shadow-sm cursor-pointer ${color} ${data.focused ? 'ring-2 ring-amber-400' : ''}`}
-      style={{ width: TABLE_WIDTH, height: TABLE_HEIGHT }}
+      title={tooltip}
+      className={`rounded-lg border-2 shadow-sm cursor-pointer ${color} ${data.focused ? 'ring-2 ring-amber-400' : ''}`}
+      style={{ width: data.width ?? TABLE_WIDTH, height: data.height ?? TABLE_HEIGHT }}
+    >
+      <Handle type="target" position={Position.Left} style={handleY} />
+      <div className={`flex items-center gap-1.5 px-3 ${bi ? 'py-1' : 'py-2'}`} style={{ height: TABLE_HEIGHT - 4 }}>
+        <Icon size={14} className="shrink-0" />
+        {bi ? (
+          <span className="flex-1 min-w-0 leading-tight">
+            <span className="block font-mono text-xs font-medium truncate">{data.label}</span>
+            {kind && <span className="block text-[10px] opacity-70 truncate">{kind}</span>}
+          </span>
+        ) : (
+          <span className="font-mono text-xs font-medium truncate">{data.label}</span>
+        )}
+        {!!data.childCount && (
+          <button
+            // `nodrag` keeps a press here from starting a node drag.
+            className="nodrag shrink-0 rounded p-0.5 hover:bg-violet-300/50 dark:hover:bg-violet-700/50 transition-colors"
+            aria-label={`${open ? 'Collapse' : 'Expand'} ${data.label}`}
+            aria-expanded={open}
+            title={open ? 'Hide what is inside' : `Show what is inside${inside ? `: ${inside}` : ''}`}
+            onClick={e => {
+              e.stopPropagation()
+              if (data.fullName) toggle(id, data.fullName)
+            }}
+          >
+            {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+          </button>
+        )}
+      </div>
+      <Handle type="source" position={Position.Right} style={handleY} />
+    </div>
+  )
+}
+
+// Something inside a model, shown in the model's box while that is open: a table, or a measure or field that is linked to others.
+const MEMBER_STYLE = {
+  measure: 'bg-white border-violet-400 text-violet-900 dark:bg-slate-900 dark:border-violet-500 dark:text-violet-100',
+  field: 'bg-lime-50 border-lime-500 text-lime-900 dark:bg-lime-900/40 dark:border-lime-600 dark:text-lime-100',
+  // Same look as a data table elsewhere in the graph: it is the same thing.
+  table: BI_NODE_STYLE.bitable.color,
+}
+
+type MemberNodeData = {
+  label: string
+  kind?: 'measure' | 'field' | 'table'
+  /** What the data calls it (shown in the tooltip). */
+  typeName?: string
+  /** Measures and fields: what the data calls the table they live in. */
+  tableTypeName?: string
+  /** Tables: what the data calls the fields and measures they hold. */
+  memberTypeNames?: { field?: string; measure?: string }
+  details?: { label: string; value: string }[]
+  width: number
+  /** Measures and fields: the table of the model they live in. */
+  table?: string
+  /** The model it belongs to. */
+  modelId?: string
+  /** Tables only. */
+  fieldCount?: number
+  measureCount?: number
+  fields?: string[]
+  measures?: string[]
+}
+
+/** "field (3): a, b, c, … +9 more" (titled with the data's name for them) — the names the graph carries are only the first few of a big table. */
+const nameList = (title: string | undefined, total = 0, names: string[] = []) =>
+  total > 0 && title ? [`${title} (${total}): ${names.join(', ')}${total > names.length ? `, … +${total - names.length} more` : ''}`] : []
+
+/** "field (3), measure (0)": how many of each a table holds, with the data's names. */
+const countLine = (data: Pick<MemberNodeData, 'fieldCount' | 'measureCount' | 'memberTypeNames'>) =>
+  ([['field', data.fieldCount], ['measure', data.measureCount]] as const)
+    .flatMap(([kind, n]) => (data.memberTypeNames?.[kind] ? [`${data.memberTypeNames[kind]} (${n ?? 0})`] : []))
+    .join(', ')
+
+function BiMemberNode({ data }: NodeProps<Node<MemberNodeData>>) {
+  const selected = useContext(SelectedChipContext)
+  const kind = data.kind === 'field' || data.kind === 'table' ? data.kind : 'measure'
+  const Icon = kind === 'field' ? Columns3 : kind === 'table' ? Sheet : Sigma
+  const tooltip = [
+    data.typeName ? `${data.label} (${data.typeName})` : data.label,
+    ...(kind === 'table'
+      ? [countLine(data), ...nameList(data.memberTypeNames?.field, data.fieldCount, data.fields), ...nameList(data.memberTypeNames?.measure, data.measureCount, data.measures)].filter(Boolean)
+      : []),
+    ...(data.table ? [data.tableTypeName ? `${data.tableTypeName}: ${data.table}` : data.table] : []),
+    ...(data.details ?? []).map(d => `${d.label}: ${d.value}`),
+    ...(kind === 'table' ? ['Click to see where each of its fields comes from and goes'] : []),
+  ].join(String.fromCharCode(10))
+  const isSelected = kind === 'table' && !!selected && selected.modelId === data.modelId && selected.table === data.label
+  return (
+    <div
+      title={tooltip}
+      className={`flex items-center gap-1.5 px-2 rounded-md border shadow-sm ${MEMBER_STYLE[kind]} ${kind === 'table' ? 'cursor-pointer' : ''} ${isSelected ? 'ring-2 ring-amber-400' : ''}`}
+      style={{ width: data.width, height: MEMBER_HEIGHT }}
     >
       <Handle type="target" position={Position.Left} />
-      <Icon size={14} className="shrink-0" />
-      <span className="font-mono text-xs font-medium truncate">{data.label}</span>
+      <Icon size={12} className="shrink-0" />
+      <span className={`text-[11px] font-medium truncate ${kind === 'table' ? 'flex-1 min-w-0' : ''}`}>{data.label}</span>
+      {kind === 'table' && (
+        <>
+          {!!data.fieldCount && <span className="shrink-0 flex items-center gap-0.5 text-[10px] opacity-70"><Columns3 size={10} />{data.fieldCount}</span>}
+          {!!data.measureCount && <span className="shrink-0 flex items-center gap-0.5 text-[10px] opacity-70"><Sigma size={10} />{data.measureCount}</span>}
+        </>
+      )}
       <Handle type="source" position={Position.Right} />
     </div>
   )
@@ -202,9 +365,6 @@ function ProcessNode({ data }: NodeProps<Node<{ label: string; queryType?: strin
   )
 }
 
-/** Opens/closes a stored-procedure box. Given by GraphCanvas, which also keeps the box where it was on screen. */
-const ContainerToggleContext = createContext<(nodeId: string, fullName: string) => void>(() => {})
-
 // A stored procedure: a box named after it that holds the processes it ran. Collapsed it is just
 // the header row and the table edges of its processes attach to it; expanded, the processes are
 // drawn inside it (as separate nodes, see layoutLineage) and their edges attach to them. Its
@@ -219,7 +379,7 @@ function StoredProcedureNode({ id, data }: NodeProps<Node<{ label: string; fqn?:
   return (
     <div
       onClick={copyFqn}
-      title={`Stored procedure ${data.fullName ?? data.label}\nClick to copy its FQN`}
+      title={`${data.fullName ?? data.label} (stored_procedure)\nClick to copy its FQN`}
       className={`rounded-lg border-2 shadow-sm cursor-pointer ${STORED_PROCEDURE_COLOR}`}
       style={{ width: data.width, height: data.height }}
     >
@@ -248,66 +408,75 @@ function StoredProcedureNode({ id, data }: NodeProps<Node<{ label: string; fqn?:
   )
 }
 
-const NODE_TYPES = { table: TableNode, process: ProcessNode, stored_procedure: StoredProcedureNode }
+const NODE_TYPES = { table: TableNode, process: ProcessNode, stored_procedure: StoredProcedureNode, bi_member: BiMemberNode }
 
-const plural = (n: number, singular: string, pluralForm = `${singular}s`) => `${n} ${n === 1 ? singular : pluralForm}`
-
-function Legend({ hasViews, biAssets, hasDirect, hasStoredProcedures, hasCalls, hasUses, mode }: {
+function Legend({ hasViews, biAssets, memberKinds, hasDirect, hasStoredProcedures, hasCalls, mode }: {
   hasViews: boolean
-  /** Power BI kinds present in the graph. */
-  biAssets: ReadonlySet<BiAssetType>
+  /** Power BI kinds present in the graph, each with the name the data gives it. */
+  biAssets: ReadonlyMap<BiAssetType, string>
+  /** Tables, measures and fields drawn inside an open model, each with the name the data gives it. */
+  memberKinds: ReadonlyMap<'measure' | 'field' | 'table', string>
   hasDirect: boolean
   hasStoredProcedures: boolean
   hasCalls: boolean
-  hasUses: boolean
   mode: GraphMode
 }) {
   const swatch = 'inline-block w-3.5 h-3.5 rounded border-2'
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-2.5 py-1.5 rounded-md border border-slate-200 dark:border-slate-700 bg-white/90 dark:bg-slate-900/90 text-[11px] text-slate-600 dark:text-slate-300 shadow-sm">
-      <span className="flex items-center gap-1.5"><span className={`${swatch} ${TABLE_NODE_COLOR}`} />Table</span>
-      {hasViews && <span className="flex items-center gap-1.5"><span className={`${swatch} ${VIEW_NODE_COLOR}`} />View</span>}
+      {/* Every entry is named as the data names it: the source_type/target_type tag (table, view, stored_procedure), or a Power BI asset's own type_name. */}
+      <span className="flex items-center gap-1.5"><span className={`${swatch} ${TABLE_NODE_COLOR}`} />table</span>
+      {hasViews && <span className="flex items-center gap-1.5"><span className={`${swatch} ${VIEW_NODE_COLOR}`} />view</span>}
       {BI_ASSET_ORDER.filter(k => biAssets.has(k)).map(k => (
-        <span key={k} className="flex items-center gap-1.5" title={`Power BI: ${BI_NODE_STYLE[k].hint}`}>
-          <span className={`${swatch} ${BI_NODE_STYLE[k].color}`} />{BI_NODE_STYLE[k].name}
+        <span key={k} className="flex items-center gap-1.5" title={BI_NODE_STYLE[k].hint}>
+          <span className={`${swatch} ${BI_NODE_STYLE[k].color}`} />{biAssets.get(k)}
         </span>
       ))}
+      {memberKinds.has('table') && (
+        <span className="flex items-center gap-1.5" title="Shown inside its model's box, with how many fields and measures it holds (hover it for their names, click it for the lineage of its fields)">
+          <span className={`${swatch} ${MEMBER_STYLE.table}`} />{memberKinds.get('table')}
+        </span>
+      )}
+      {memberKinds.has('measure') && (
+        <span className="flex items-center gap-1.5" title="Shown inside its model's box, linked from the fields and measures it is evaluated from">
+          <span className={`${swatch} ${MEMBER_STYLE.measure}`} />{memberKinds.get('measure')}
+        </span>
+      )}
+      {memberKinds.has('field') && (
+        <span className="flex items-center gap-1.5" title="A column of a table in the model that a measure is evaluated from">
+          <span className={`${swatch} ${MEMBER_STYLE.field}`} />{memberKinds.get('field')}
+        </span>
+      )}
       {hasStoredProcedures && (
-        <span className="flex items-center gap-1.5" title="Stored procedure: holds the processes it ran. Click its arrow to show or hide them.">
-          <span className={`${swatch} ${STORED_PROCEDURE_COLOR}`} />Stored procedure
+        <span className="flex items-center gap-1.5" title="Holds the processes it ran. Click its arrow to show or hide them.">
+          <span className={`${swatch} ${STORED_PROCEDURE_COLOR}`} />stored_procedure
         </span>
       )}
       {mode === 'mapping' ? (
-        <span className="flex items-center gap-1.5" title="Source table/view → target table/view: data is mapped from one to the other (maps_to)">
+        <span className="flex items-center gap-1.5" title="maps_to: data is mapped from the one on the left to the one on the right">
           <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.mapping} strokeWidth="2" /></svg>
-          maps to
+          maps_to
         </span>
       ) : (
         <>
-          <span className="flex items-center gap-1.5" title="Table → process: the process reads from the table">
+          <span className="flex items-center gap-1.5" title="read_by: the one on the left is read by the one on the right">
             <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.input} strokeWidth="2" /></svg>
-            read
+            read_by
           </span>
-          <span className="flex items-center gap-1.5" title="Process → table: the process writes to the table">
+          <span className="flex items-center gap-1.5" title="writes_to: the one on the left writes the one on the right">
             <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.output} strokeWidth="2" strokeDasharray="4 3" /></svg>
-            write
+            writes_to
           </span>
           {hasDirect && (
-            <span className="flex items-center gap-1.5" title="Source table/view → view: a view has no process, so it is linked straight to what it maps from (maps_to)">
+            <span className="flex items-center gap-1.5" title="maps_to: a view has no process, so it is linked straight to what it maps from">
               <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.direct} strokeWidth="2" /></svg>
-              maps to
+              maps_to
             </span>
           )}
           {hasCalls && (
-            <span className="flex items-center gap-1.5" title="Stored procedure → stored procedure: the first one calls the second">
+            <span className="flex items-center gap-1.5" title="calls: the one on the left calls the one on the right">
               <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.calls} strokeWidth="2" /></svg>
               calls
-            </span>
-          )}
-          {hasUses && (
-            <span className="flex items-center gap-1.5" title="Power BI: the asset on the right is built on the one on the left (source table → model, data table → model, model → report or tile, report → tile)">
-              <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.uses} strokeWidth="2" /></svg>
-              used by
             </span>
           )}
         </>
@@ -323,8 +492,62 @@ interface CanvasProps {
   onTableClick: (fullName: string) => void
   /** Opens or closes the stored-procedure box with this `full_name`. */
   onToggleContainer: (fullName: string) => void
+  /** A table of a model was clicked: show the lineage of its fields. */
+  onTableChipClick: (chip: { modelId: string; table: string }) => void
   /** Frame just these nodes on first render instead of the whole graph (which may be far too big to read). */
   fitNodeIds?: string[]
+  maximized: boolean
+  onToggleMaximized: () => void
+}
+
+/** Maximize / restore button in the graph's top-right corner: the same icon spot in both states, like a map's full-screen control. */
+function MaximizeButton({ maximized, onToggle }: { maximized: boolean; onToggle: () => void }) {
+  const Icon = maximized ? Minimize2 : Maximize2
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-label={maximized ? 'Exit full view' : 'Maximize lineage view'}
+      title={maximized ? 'Exit full view (Esc)' : 'Maximize: show only the lineage, full window'}
+      data-testid="lineage-maximize"
+      className="flex items-center justify-center w-8 h-8 rounded-md border border-slate-300 dark:border-slate-700 bg-white/90 dark:bg-slate-900/90 text-slate-600 dark:text-slate-300 shadow-sm transition-colors hover:bg-indigo-50 dark:hover:bg-slate-800 hover:text-indigo-600 dark:hover:text-indigo-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+    >
+      <Icon size={16} />
+    </button>
+  )
+}
+
+/**
+ * Re-frames the graph once the canvas has finished resizing after `maximized` flips. React Flow keeps the viewport as
+ * it was, which would leave the graph in the old top-left corner of a much bigger (or smaller) area. Renders nothing;
+ * it lives inside <ReactFlow> to reach its store, whose width/height are updated by React Flow's own resize observer.
+ */
+function RefitOnMaximizeChange({ maximized, options }: { maximized: boolean; options: FitViewOptions }) {
+  const { fitView } = useReactFlow()
+  const size = useStore(s => `${s.width}x${s.height}`)
+  const pending = useRef(false)
+  const first = useRef(true)
+  const latest = useRef(options)
+  latest.current = options
+
+  useEffect(() => {
+    if (first.current) {
+      first.current = false
+      return
+    }
+    pending.current = true
+    // If the canvas ends up the same size, the refit below never fires: don't leave it armed for an unrelated resize.
+    const timer = setTimeout(() => { pending.current = false }, 600)
+    return () => clearTimeout(timer)
+  }, [maximized])
+
+  useEffect(() => {
+    if (!pending.current) return
+    pending.current = false
+    void fitView({ ...latest.current, duration: 200 })
+  }, [size, fitView])
+
+  return null
 }
 
 // Seeds React Flow's node/edge state from props on mount. FlowGraph gives this a fresh
@@ -336,8 +559,11 @@ interface CanvasProps {
 // which arrives here as new `nodes`/`edges` props that replace the state (dragging is dropped
 // as above). The viewport is left alone, except that it is shifted so the box that was
 // clicked stays where it was on screen instead of being carried off by the new layout.
-function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableClick, onToggleContainer, fitNodeIds }: CanvasProps) {
+function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableClick, onToggleContainer, onTableChipClick, fitNodeIds, maximized, onToggleMaximized }: CanvasProps) {
   const { theme } = useTheme()
+  // Room at the top keeps the legend (top-left, over the canvas) clear of the content. (A plain number is a ratio that
+  // works out to only ~6% of the height, less than the legend's.)
+  const fitOptions: FitViewOptions = fitNodeIds ? { nodes: fitNodeIds.map(id => ({ id })), padding: 0.3, maxZoom: 1 } : { padding: { top: '68px', right: '24px', bottom: '24px', left: '24px' } }
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>(initialNodes)
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initialEdges)
   const flow = useRef<ReactFlowInstance | null>(null)
@@ -388,6 +614,9 @@ function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableCl
       onInit={instance => { flow.current = instance }}
       onNodeClick={(_, node) => {
         if (node.type === 'table' && typeof node.data.fullName === 'string') onTableClick(node.data.fullName)
+        else if (node.type === 'bi_member' && node.data.kind === 'table' && typeof node.data.modelId === 'string') {
+          onTableChipClick({ modelId: node.data.modelId, table: String(node.data.label) })
+        }
       }}
       nodeTypes={NODE_TYPES}
       colorMode={theme}
@@ -400,21 +629,27 @@ function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableCl
       // Default 0.5 can't fit a graph of a few hundred nodes on screen.
       minZoom={0.05}
       fitView
-      // The extra default margin keeps the legend (top-left) clear of the first fit's content.
-      fitViewOptions={fitNodeIds ? { nodes: fitNodeIds.map(id => ({ id })), padding: 0.3, maxZoom: 1 } : { padding: 0.15 }}
+      fitViewOptions={fitOptions}
       proOptions={{ hideAttribution: true }}
     >
       <Background />
-      <Controls />
+      {/* The same margin as the first fit, which keeps the legend (top-left) clear of the content. */}
+      <Controls fitViewOptions={fitOptions} />
       <MiniMap pannable zoomable />
+      <RefitOnMaximizeChange maximized={maximized} options={fitOptions} />
+      <Panel position="top-right">
+        <MaximizeButton maximized={maximized} onToggle={onToggleMaximized} />
+      </Panel>
       <Panel position="top-left">
         <Legend
           hasViews={initialNodes.some(n => n.data.isView)}
-          biAssets={new Set(initialNodes.flatMap(n => (n.data.assetType ? [n.data.assetType as BiAssetType] : [])))}
+          biAssets={new Map(initialNodes.flatMap(n => (n.data.assetType && n.data.typeName ? [[n.data.assetType as BiAssetType, n.data.typeName as string] as const] : [])))}
+          memberKinds={new Map(initialNodes.flatMap(n => (
+            n.type === 'bi_member' && n.data.typeName ? [[(n.data.kind === 'field' || n.data.kind === 'table' ? n.data.kind : 'measure') as 'measure' | 'field' | 'table', n.data.typeName as string] as const] : []
+          )))}
           hasDirect={initialEdges.some(e => e.data?.kind === 'direct')}
           hasStoredProcedures={initialNodes.some(n => n.type === 'stored_procedure')}
           hasCalls={initialEdges.some(e => e.data?.kind === 'calls')}
-          hasUses={initialEdges.some(e => e.data?.kind === 'uses')}
           mode={mode}
         />
       </Panel>
@@ -423,13 +658,13 @@ function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableCl
   )
 }
 
-export default function FlowGraph({ folder, focusTable, onFocusChange, focusScope, onScopeChange, graphMode, onGraphModeChange }: Props) {
-  // One graph per folder+mode, kept for as long as this tab is open so flipping the
+export default function FlowGraph({ folder, crawl, focusTable, onFocusChange, focusScope, onScopeChange, graphMode, onGraphModeChange, maximized = false, onMaximizedChange }: Props) {
+  // One graph per folder+mode+crawl, kept for as long as this tab is open so flipping the
   // selector back and forth doesn't refetch. `focusTable` is a full_name, which is the
   // same in every mode, so a focused asset stays focused when the mode changes.
   const [cache, setCache] = useState<Record<string, LineageGraph>>({})
   const [errors, setErrors] = useState<Record<string, string>>({})
-  const cacheKey = `${folder}|${graphMode}`
+  const cacheKey = `${folder}|${graphMode}|${crawl ?? ''}`
   const graph = cache[cacheKey] ?? null
   const error = errors[cacheKey] ?? null
   const loading = !graph && !error
@@ -438,11 +673,11 @@ export default function FlowGraph({ folder, focusTable, onFocusChange, focusScop
     if (cache[cacheKey]) return
     let cancelled = false
     setErrors(({ [cacheKey]: _dropped, ...rest }) => rest)
-    getGraph(folder, graphMode)
+    getGraph(folder, graphMode, crawl)
       .then(g => { if (!cancelled) setCache(c => ({ ...c, [cacheKey]: g })) })
       .catch(e => { if (!cancelled) setErrors(x => ({ ...x, [cacheKey]: e.message })) })
     return () => { cancelled = true }
-    // Deliberately keyed on cacheKey alone: refetch only when the folder or mode changes.
+    // Deliberately keyed on cacheKey alone: refetch only when the folder, mode or crawl changes.
   }, [cacheKey])
 
   // `full_name`s of the stored-procedure boxes that are open; everything starts collapsed.
@@ -470,6 +705,12 @@ export default function FlowGraph({ folder, focusTable, onFocusChange, focusScop
     [focused, expanded, focusTable, focusScope],
   )
 
+  // The focused asset's node, to show a Power BI asset by name rather than by its key.
+  const focusNode = useMemo(
+    () => (graph && focusTable ? graph.nodes.find(n => n.type === 'table' && n.full_name === focusTable) : undefined),
+    [graph, focusTable],
+  )
+
   const isMapping = graphMode === 'mapping'
   const shown = focusTable ? focusedLayout : fullLayout
   const graphEmpty = !loading && !error && !!graph && graph.nodes.length === 0
@@ -479,6 +720,27 @@ export default function FlowGraph({ folder, focusTable, onFocusChange, focusScop
     const drawn = new Set(shown.nodes.map(n => n.id))
     return [...focused.pathNodeIds].filter(id => drawn.has(id))
   }, [shown, focusTable, focusScope, focused])
+
+  // The table of a model whose column lineage is open. Belongs to the graph on screen, so it goes with it.
+  const [chip, setChip] = useState<{ modelId: string; table: string } | null>(null)
+  useEffect(() => { setChip(null) }, [folder, crawl, graphMode])
+
+  // Esc closes the column lineage first, then leaves the maximized view. The restore button is part of the canvas, so if there is no canvas to show (loading,
+  // error, nothing to draw) the view must not stay maximized with no way out.
+  const canMaximize = !loading && !error && !graphEmpty && !!shown
+  useEffect(() => {
+    if (maximized && !canMaximize) onMaximizedChange?.(false)
+  }, [maximized, canMaximize, onMaximizedChange])
+  useEffect(() => {
+    if (!maximized && !chip) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return
+      if (chip) setChip(null)
+      else onMaximizedChange?.(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [maximized, chip, onMaximizedChange])
 
   // The selector and banner render in every state, including loading/error/empty, so a
   // mode with nothing to show (e.g. no maps_to edges) can always be switched away from.
@@ -495,18 +757,23 @@ export default function FlowGraph({ folder, focusTable, onFocusChange, focusScop
     )
   } else {
     body = (
-      <div className="relative flex-1 min-h-0 rounded-lg border border-slate-200 dark:border-slate-800 overflow-hidden">
+      <div className={`relative flex-1 min-h-0 overflow-hidden ${maximized ? '' : 'rounded-lg border border-slate-200 dark:border-slate-800'}`}>
         {shown ? (
           <div className="absolute inset-0">
-            <GraphCanvas
-              key={`${folder}|${graphMode}|${focusTable ?? ''}|${focusTable ? focusScope : ''}`}
-              nodes={shown.nodes}
-              edges={shown.edges}
-              mode={graphMode}
-              onTableClick={onFocusChange}
-              onToggleContainer={toggleContainer}
-              fitNodeIds={fitNodeIds}
-            />
+            <SelectedChipContext.Provider value={chip}>
+              <GraphCanvas
+                key={`${folder}|${graphMode}|${focusTable ?? ''}|${focusTable ? focusScope : ''}`}
+                nodes={shown.nodes}
+                edges={shown.edges}
+                mode={graphMode}
+                onTableClick={onFocusChange}
+                onToggleContainer={toggleContainer}
+                onTableChipClick={setChip}
+                fitNodeIds={fitNodeIds}
+                maximized={maximized}
+                onToggleMaximized={() => onMaximizedChange?.(!maximized)}
+              />
+            </SelectedChipContext.Provider>
           </div>
         ) : (
           <div className="p-4 text-sm text-slate-500 italic">
@@ -515,13 +782,16 @@ export default function FlowGraph({ folder, focusTable, onFocusChange, focusScop
               : <>No lineage found for <span className="font-mono not-italic">{focusTable}</span> — no process reads from or writes to it.</>}
           </div>
         )}
+        {chip && <ColumnLineagePanel folder={folder} crawl={crawl} modelId={chip.modelId} table={chip.table} onClose={() => setChip(null)} />}
       </div>
     )
   }
 
   return (
-    <div className="flex flex-col h-full gap-2">
-      <div className="shrink-0 flex flex-wrap items-center gap-x-4 gap-y-1">
+    <div className={`flex flex-col h-full ${maximized ? '' : 'gap-2'}`}>
+      {/* Announces the mode change to screen readers (the visible change is the whole window filling with the graph). */}
+      <span className="sr-only" role="status">{maximized ? 'Lineage maximized. Press Escape to exit.' : ''}</span>
+      <div className={`shrink-0 flex-wrap items-center gap-x-4 gap-y-1 ${maximized ? 'hidden' : 'flex'}`}>
         <Segmented ariaLabel="Lineage view" options={MODE_OPTIONS} value={graphMode} onChange={onGraphModeChange} tone="indigo" />
         {!focusTable && (
           <span className="flex items-center gap-1.5 text-xs text-slate-500">
@@ -532,16 +802,17 @@ export default function FlowGraph({ folder, focusTable, onFocusChange, focusScop
       </div>
 
       {focusTable && (
-        <div className="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 rounded-lg border border-amber-300 dark:border-amber-700/60 bg-amber-50 dark:bg-amber-900/20 text-sm">
+        <div className={`shrink-0 flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 rounded-lg border border-amber-300 dark:border-amber-700/60 bg-amber-50 dark:bg-amber-900/20 text-sm ${maximized ? 'hidden' : 'flex'}`}>
           <Crosshair size={14} className="shrink-0 text-amber-600 dark:text-amber-400" />
           <span className="text-slate-600 dark:text-slate-400">{isMapping ? 'Data mapping of' : 'Lineage of'}</span>
-          <span className="font-mono font-semibold text-cyan-700 dark:text-cyan-300 break-all">{focusTable}</span>
+          <span className="font-mono font-semibold text-cyan-700 dark:text-cyan-300 break-all" title={focusTable}>{focusNode?.asset_type ? focusNode.label : focusTable}</span>
+          {focusNode?.asset_type && focusNode.type_name && <span className="text-xs text-slate-500">({focusNode.type_name})</span>}
           {focused && (
             <span className="text-xs text-slate-500 tabular-nums">
               {plural(focused.upstreamTables, 'upstream table')} · {plural(focused.downstreamTables, 'downstream table')}
               {focusScope === 'full' && <> · {plural(focused.relatedTables, 'related table')} (dimmed)</>}
               {focused.processes > 0 && <> · {plural(focused.processes, 'process', 'processes')}</>}
-              {focused.storedProcedures > 0 && <> · {plural(focused.storedProcedures, 'stored procedure')}</>}
+              {focused.storedProcedures > 0 && <> · stored_procedure ({focused.storedProcedures})</>}
             </span>
           )}
           <div className="ml-auto flex items-center gap-2">
