@@ -114,17 +114,19 @@ def find_lineage_bundle(path: Path) -> dict[str, Any] | None:
     return None
 
 
-def get_root_paths() -> list[dict[str, str]]:
+def get_root_paths(ezview_root: Path | None = None) -> list[dict[str, str]]:
+    """The folders the browser can start from. The FIRST one is the folder it opens by default: the pipeline's
+    `staged_output` (where the bundles are), then its parent `data-lineage`, then Home and Documents."""
     roots: list[dict[str, str]] = []
-    current_file = Path(__file__).resolve()
-    ezview_root = current_file.parent.parent.parent  # ezview/
+    if ezview_root is None:
+        ezview_root = Path(__file__).resolve().parent.parent.parent  # ezview/
     sibling_lineage = ezview_root.parent / "data-lineage"
 
     if sibling_lineage.is_dir():
-        roots.append({"label": "data-lineage", "path": str(sibling_lineage)})
         staged = sibling_lineage / "staged_output"
         if staged.is_dir():
             roots.append({"label": "staged_output", "path": str(staged)})
+        roots.append({"label": "data-lineage", "path": str(sibling_lineage)})
 
     home = Path.home()
     roots.append({"label": "Home", "path": str(home)})

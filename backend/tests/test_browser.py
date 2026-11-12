@@ -134,6 +134,19 @@ def test_suggested_actions_json_no_duplicates(tmp_path: Path):
 
 # -- API route smoke tests --
 
+def test_browser_opens_staged_output_by_default_then_its_parent(tmp_path: Path):
+    from services.filesystem import get_root_paths
+    staged = tmp_path / "data-lineage" / "staged_output"
+    staged.mkdir(parents=True)
+    roots = get_root_paths(tmp_path / "ezview")
+    assert [r["label"] for r in roots[:2]] == ["staged_output", "data-lineage"]      # the first is the default
+    assert roots[0]["path"] == str(staged) and roots[1]["path"] == str(tmp_path / "data-lineage")
+
+    (tmp_path / "other").mkdir()           # no staged_output beside the pipeline: its parent is the first
+    (tmp_path / "other" / "data-lineage").mkdir()
+    assert get_root_paths(tmp_path / "other" / "ezview")[0]["label"] == "data-lineage"
+
+
 def test_browser_roots_returns_list(client):
     resp = client.get("/api/browser/roots")
     assert resp.status_code == 200
