@@ -1,6 +1,8 @@
 """Tests for FQN parsing, analysis service, and lineage API routes."""
 from __future__ import annotations
 
+from collections import Counter
+
 import pandas as pd
 import pytest
 
@@ -214,6 +216,15 @@ def test_edge_page_options_returned():
     result = get_edge_page(df)
     assert "confidence_options" in result
     assert "HIGH" in result["confidence_options"]
+
+
+def test_edge_page_has_every_column_of_the_file_in_its_order_and_every_row_has_them_all():
+    df = pd.DataFrame(EDGES_ROWS).assign(process_fqn=None, expression="a + b", is_temporary_source=False, evidence_kind=None)
+    result = get_edge_page(df)
+    assert result["columns"] == list(df.columns)
+    assert all(list(row) == list(df.columns) for row in result["rows"])
+    # nothing is left out by a filter that matches nothing either: the columns are the file's, not the page's
+    assert get_edge_page(df, confidence="NO-SUCH-LEVEL")["rows"] == [] and get_edge_page(df, confidence="NO-SUCH-LEVEL")["columns"] == list(df.columns)
 
 
 # ---------------------------------------------------------------------------
@@ -567,17 +578,20 @@ POWERBI_ROWS = [
 
 
 def test_parse_asset_reads_power_bi_endpoints_by_their_type_tag():
+    # a table, a field and a measure are all INSIDE their model: they roll up into it, as a column does into a table
     field = parse_asset(f"{PB}/m1/Sales%20Data/Amount", "bifield")
-    assert (field["type"], field["asset_type"]) == ("column", "bitable")
-    assert (field["database"], field["schema"], field["table"], field["column"]) == ("powerbi", "m1", "Sales Data", "Amount")   # %20 decoded
+    assert (field["type"], field["asset_type"], field["bi_type"]) == ("column", "bimodel", "bifield")
+    assert (field["database"], field["schema"], field["table"], field["column"]) == ("powerbi", "m1", "(model)", "Sales_Data_Amount")   # as an id spells it
+    assert (field["member_table"], field["member_name"]) == ("Sales Data", "Amount")                                                  # %20 decoded
 
     measure = parse_asset(f"{PB}/m1/Total%20Amount", "bimeasure")
-    assert (measure["type"], measure["asset_type"], measure["table"], measure["column"]) == ("column", "bimodel", "(model)", "Total Amount")
+    assert (measure["type"], measure["asset_type"], measure["table"], measure["column"]) == ("column", "bimodel", "(model)", "Total_Amount")
     assert parse_asset(f"{PB}/m1", "bimodel")["table"] == "(model)"      # a model is the table its measures are columns of
     assert parse_asset(f"{PB}/r1", "bireport")["schema"] == "(reports)"
     tile = parse_asset(f"{PB}/d1/t1", "bitile")
     assert (tile["asset_type"], tile["schema"], tile["table"]) == ("bitile", "d1", "t1")
-    assert parse_asset(f"{PB}/m1/Sales%20Data", "bitable")["asset_type"] == "bitable"
+    sem_table = parse_asset(f"{PB}/m1/Sales%20Data", "bitable")
+    assert (sem_table["asset_type"], sem_table["bi_type"], sem_table["schema"], sem_table["member_table"]) == ("bimodel", "bisemtable", "m1", "Sales Data")
 
     # the same FQN without the tag is read by depth, as any database object
     assert parse_asset(f"{PB}/m1/Sales%20Data/Amount")["type"] == "table"
@@ -595,37 +609,69 @@ def test_power_bi_graph_chains_source_table_to_report():
     graph = get_lineage_graph(pd.DataFrame(POWERBI_ROWS), None)
     nodes = {n["id"]: n for n in graph["nodes"]}
     name = {i: n.get("full_name") or n["process_fqn"] for i, n in nodes.items()}
-    links = {(name[e["source"]], name[e["target"]], e["kind"]) for e in graph["edges"]}
+    links = {(name[e["source"]], name[e["target"]], e["kind"], bool(e.get("summary"))) for e in graph["edges"]}
 
-    # a field is not a table of its own: it rolls up into its data table, a measure into its model
+    # a table of a model, a field and a measure are not nodes of their own: they are inside their model's node
     assert {n["full_name"] for n in graph["nodes"] if n["type"] == "table"} == {
-        "ip.dbo.orders",
-        "powerbi.m1.Sales Data", "powerbi.m1.(model)", "powerbi.(reports).r1", "powerbi.d1.t1",
-        "powerbi.m2.Lonely", "powerbi.m2.(model)",
+        "ip.dbo.orders", "powerbi.m1.(model)", "powerbi.(reports).r1", "powerbi.d1.t1", "powerbi.m2.(model)",
+    }
+    assert {(n["member_kind"], n["label"], n["parent_id"] == next(i for i, x in nodes.items() if x.get("full_name") == f"powerbi.{n['model_id']}.(model)"))
+            for n in graph["nodes"] if n["type"] == "bi_member"} == {
+        ("table", "Sales Data", True), ("table", "Lonely", True),      # the tables the edges name, as written
+        ("field", "Sales Data[Amount]", True), ("measure", "Total Amount", True), ("measure", "Other", True),
     }
     assert links == {
-        # the SQL process that loads the data table keeps its read/write edges
-        ("ip.dbo.orders", BI_PROC, "input"),
-        (BI_PROC, "powerbi.m1.Sales Data", "output"),
-        (BI_PROC, "powerbi.m2.Lonely", "output"),
-        # everything without a process: "used by" edges
-        ("powerbi.m1.Sales Data", "powerbi.m1.(model)", "uses"),   # a measure reads its fields (one edge for every field)
-        ("ip.dbo.orders", "powerbi.m1.(model)", "uses"),
-        ("powerbi.m1.(model)", "powerbi.(reports).r1", "uses"),
-        ("powerbi.m1.(model)", "powerbi.d1.t1", "uses"),
-        ("powerbi.(reports).r1", "powerbi.d1.t1", "uses"),
-        ("powerbi.m2.Lonely", "powerbi.m2.(model)", "uses"),       # implied by the FQN: no measure reads it
-        ("ip.dbo.orders", "powerbi.m2.(model)", "uses"),
-        # a measure built on another measure of its model: a link between the two, drawn inside the model
-        ("powerbi.m1.(model).Total Amount", "powerbi.m1.(model).Other", "uses"),
+        # the SQL process that loads the model's tables keeps its read/write edges: to the model (what a closed model
+        # shows, flagged as the roll-up) and to the table it writes (what an open one shows)
+        ("ip.dbo.orders", BI_PROC, "input", False),
+        (BI_PROC, "powerbi.m1.(model)", "output", True),
+        (BI_PROC, "powerbi.m2.(model)", "output", True),
+        (BI_PROC, "powerbi.m1.(model).Sales Data", "output", False),
+        (BI_PROC, "powerbi.m2.(model).Lonely", "output", False),
+        # everything without a process: `read_by` links. The source table -> model edge is not drawn again: the process is
+        # already the way that table reaches the model
+        ("powerbi.m1.(model)", "powerbi.(reports).r1", "uses", False),
+        ("powerbi.m1.(model)", "powerbi.d1.t1", "uses", False),
+        ("powerbi.(reports).r1", "powerbi.d1.t1", "uses", False),
+        # a measure built on a field / another measure of its model: a link between the two, drawn inside the model
+        ("powerbi.m1.(model).Sales_Data_Amount", "powerbi.m1.(model).Total_Amount", "uses", False),
+        ("powerbi.m1.(model).Total_Amount", "powerbi.m1.(model).Other", "uses", False),
     }
-    # (measure -> measure inside one model, and field -> measure's table == model, add no self-loop)
+    # (measure -> measure inside one model adds no self-loop)
     assert all(name[e["source"]] != name[e["target"]] for e in graph["edges"])
+
+
+def test_power_bi_links_are_drawn_as_the_name_the_data_gives_them():
+    # read_by stays what it was; a link that only `maps_to` edges say (a bundle writes its field -> measure and
+    # field -> field links that way) is a maps_to: never a read_by that the data does not have
+    rows = [_typed_row("maps_to", f"{PB}/m1/Sales/Amount", f"{PB}/m1/Total", "bifield", "bimeasure", None),
+            _typed_row("read_by", f"{PB}/m1", f"{PB}/r1", "bimodel", "bireport", None),
+            _typed_row("maps_to", f"{PB}/m1/Sales/Amount", f"{PB}/m2/Sales/Amount", "bifield", "bifield", None),   # rolls up to model -> model…
+            _typed_row("read_by", f"{PB}/m1", f"{PB}/m2", "bimodel", "bimodel", None)]                              # …which is also a read_by
+    graph = get_lineage_graph(pd.DataFrame(rows), None)
+    name = {n["id"]: n.get("full_name") for n in graph["nodes"]}
+    links = {(name[e["source"]], name[e["target"]]): e["kind"] for e in graph["edges"]}
+    assert links[("powerbi.m1.(model).Sales_Amount", "powerbi.m1.(model).Total")] == "direct"      # maps_to (the legend's colour for it)
+    assert links[("powerbi.m1.(model)", "powerbi.(reports).r1")] == "uses"                          # read_by
+    assert links[("powerbi.m1.(model)", "powerbi.m2.(model)")] == "uses"                            # read_by wins where both say it
+
+
+def test_a_table_of_a_model_a_process_writes_is_linked_to_the_process_and_the_models_link_is_its_roll_up():
+    rows = [_typed_row("read_by", f"{SQL}/orders", BI_PROC, "table", "dataprocess", BI_PROC),
+            _typed_row("writes_to", BI_PROC, f"{PB}/m1/Sales", "dataprocess", "bitable", BI_PROC),
+            _typed_row("read_by", f"{SQL}/orders", f"{PB}/m1", "table", "bimodel", None)]
+    graph = get_lineage_graph(pd.DataFrame(rows), None)
+    name = {n["id"]: n.get("full_name") or n["process_fqn"] for n in graph["nodes"]}
+    links = {(name[e["source"]], name[e["target"]], e["kind"]): bool(e.get("summary")) for e in graph["edges"]}
+    assert links == {
+        ("ip.dbo.orders", BI_PROC, "input"): False,
+        (BI_PROC, "powerbi.m1.(model)", "output"): True,          # to the whole model: left out by the client while the model is open
+        (BI_PROC, "powerbi.m1.(model).Sales", "output"): False,   # to the table
+    }
 
 
 def test_power_bi_nodes_carry_their_asset_type_and_a_readable_label():
     nodes = {n["full_name"]: n for n in get_lineage_graph(pd.DataFrame(POWERBI_ROWS), None)["nodes"] if n["type"] == "table"}
-    assert nodes["powerbi.m1.Sales Data"]["asset_type"] == "bitable" and nodes["powerbi.m1.Sales Data"]["label"] == "Sales Data"
     # models, reports and tiles only have GUIDs until their names are known: show the start of the id
     assert (nodes["powerbi.m1.(model)"]["asset_type"], nodes["powerbi.m1.(model)"]["label"]) == ("bimodel", "m1")
     assert (nodes["powerbi.(reports).r1"]["asset_type"], nodes["powerbi.(reports).r1"]["label"]) == ("bireport", "r1")
@@ -639,6 +685,7 @@ def test_power_bi_summary_counts_bi_assets_apart_from_databases():
     # one physical table and column; the model ids, data tables and fields are not databases/schemas/tables
     assert (s["unique_databases"], s["unique_schemas"], s["unique_tables"], s["unique_columns"]) == (1, 1, 1, 1)
     assert s["bi_assets"] == {"models": 2, "reports": 1, "dashboards": 0, "tiles": 1, "tables": 2, "fields": 1, "measures": 2}
+    assert s["bi_asset_type_names"]["tables"] == "bitable"
     assert {"pbsys", "dbsys"} <= set(s["system_names"])
 
 
@@ -646,27 +693,28 @@ def test_summary_has_no_bi_assets_for_a_database_bundle():
     assert "bi_assets" not in compute_summary(pd.DataFrame(NO_PROCESS_VIEW_ROWS), pd.DataFrame())
 
 
-def test_power_bi_assets_tree_groups_fields_under_their_data_table():
+def test_power_bi_assets_tree_lists_a_models_fields_and_measures_as_its_columns():
     tree = {d["database"]: d for d in build_asset_tree(pd.DataFrame(POWERBI_ROWS))}
     assert set(tree) == {"ip", "powerbi"}
     model = {t["table"]: t for t in {s["schema"]: s for s in tree["powerbi"]["schemas"]}["m1"]["tables"]}
-    assert model["Sales Data"]["columns"] == ["Amount"]                  # the field, not a table named "Amount"
-    assert model["(model)"]["columns"] == ["Other", "Total Amount"]      # a model's columns are its measures
+    assert set(model) == {"(model)"}                                     # the model's tables are not tables of the tree
+    assert model["(model)"]["columns"] == ["Other", "Sales_Data_Amount", "Total_Amount"]     # its fields and measures, as ids spell them
+    assert model["(model)"]["column_kinds"] == {"Sales_Data_Amount": "field", "Total_Amount": "measure", "Other": "measure"}
     assert {s["schema"] for s in tree["powerbi"]["schemas"]} == {"m1", "m2", "(reports)", "d1"}
 
 
-def test_power_bi_data_mapping_links_source_table_to_data_table():
+def test_power_bi_data_mapping_links_source_table_to_the_model_it_loads():
     graph = get_mapping_graph(pd.DataFrame(POWERBI_ROWS))
     name = {n["id"]: n["full_name"] for n in graph["nodes"]}
     assert {(name[e["source"]], name[e["target"]], e["column_count"]) for e in graph["edges"]} == {
-        ("ip.dbo.orders", "powerbi.m1.Sales Data", 1),
+        ("ip.dbo.orders", "powerbi.m1.(model)", 1),
     }
-    assert next(n for n in graph["nodes"] if n["full_name"] == "powerbi.m1.Sales Data")["asset_type"] == "bitable"
+    assert next(n for n in graph["nodes"] if n["full_name"] == "powerbi.m1.(model)")["asset_type"] == "bimodel"
 
 
-def test_power_bi_flow_pairs_go_from_the_source_table_to_the_data_table():
+def test_power_bi_flow_pairs_go_from_the_source_table_to_the_model():
     pairs = {(p["source_table"], p["target_table"]) for p in get_flow_pairs(pd.DataFrame(POWERBI_ROWS))}
-    assert pairs == {("ip.dbo.orders", "powerbi.m1.Sales Data"), ("ip.dbo.orders", "powerbi.m2.Lonely")}
+    assert pairs == {("ip.dbo.orders", "powerbi.m1.(model)"), ("ip.dbo.orders", "powerbi.m2.(model)")}
 
 
 def test_percent_encoded_names_are_shown_decoded():
@@ -1034,9 +1082,12 @@ def test_live_scanner_nodes_carry_the_kind_the_path_names_not_a_name_of_ours():
 
 
 def test_tagged_nodes_carry_the_tag_the_data_gives_them():
-    names = _names(get_lineage_graph(pd.DataFrame(POWERBI_ROWS), None))
-    assert {v for v in names.values() if v} == {"bimodel", "bireport", "bitile", "bitable"}
+    graph = get_lineage_graph(pd.DataFrame(POWERBI_ROWS), None)
+    names = _names(graph)
+    assert {v for v in names.values() if v} == {"bimodel", "bireport", "bitile"}
     assert names[f"powerbi.m1.(model)"] == "bimodel" and names["powerbi.(reports).r1"] == "bireport"
+    # a table of a model is not a node of its own: it is a table inside its model, named by its tag too
+    assert {n["type_name"] for n in graph["nodes"] if n.get("member_kind") == "table"} == {"bitable"}
 
 
 def test_the_summary_labels_the_power_bi_counts_with_the_names_the_data_uses():
@@ -1088,8 +1139,15 @@ def test_parse_asset_reads_the_typed_layout_by_its_tag():
     assert (measure["column"], measure["type_name"]) == ("Written_Premium__New_", "bimeasure")
     assert (p(f"{PBI}/r1", "bireport")["table"], p(f"{PBI}/d1/t1", "bitile")["schema"], p(f"{PBI}/df1", "bidataflow")["schema"]) == ("r1", "d1", "(dataflows)")
     assert p(f"{PBI}/{MODEL}/Sales/Amount", "bimodel")["type"] == "unresolved"      # the wrong number of segments for the tag
-    # the older tagged layout (with the platform segment) still reads the same
-    assert parse_asset("/pbsys/powerbi/m1/Sales", "bitable")["asset_type"] == "bitable"
+    # with the platform segment (/<sys>/powerbi/<model id>/…) it reads the same: its tables are inside the model too
+    with_platform = parse_asset("/xenon/powerbi/m1/Sales/Amount", "bifield")
+    assert (with_platform["type"], with_platform["asset_type"], with_platform["bi_type"]) == ("column", "bimodel", "bifield")
+    assert (with_platform["database"], with_platform["schema"], with_platform["table"], with_platform["column"]) == ("powerbi", "m1", "(model)", "Sales_Amount")
+    assert (with_platform["member_table"], with_platform["member_name"]) == ("Sales", "Amount")      # as written, not as an id spells it
+    sem_table = parse_asset("/xenon/powerbi/m1/Sales", "bitable")
+    assert (sem_table["bi_type"], sem_table["asset_type"], sem_table["column"]) == ("bisemtable", "bimodel", "Sales")
+    assert parse_asset("/xenon/powerbi/m1", "bimodel")["table"] == "(model)"
+    assert parse_asset("/xenon/powerbi/d1/t1", "bitile")["schema"] == "d1"
 
 
 def test_typed_graph_shows_the_tags_as_the_names_of_its_nodes_and_links_tables_to_tables():
@@ -1112,6 +1170,152 @@ def test_typed_graph_shows_the_tags_as_the_names_of_its_nodes_and_links_tables_t
     assert any(nodes[e["source"]].get("asset_type") == "bidataflow" and name(e["target"]) == "11:Sales" for e in graph["edges"])   # a dataflow feeds a table
     inside = {(name(e["source"]), name(e["target"])) for e in graph["edges"] if nodes[e["source"]].get("member_kind") in ("field", "measure")}
     assert inside == {("11:Sales[Amount]", "11:Total Amount"), ("11:Total Amount", "11:Margin")}
+
+
+def test_the_tables_the_edges_name_are_shown_in_their_model_when_nothing_else_lists_them():
+    graph = get_lineage_graph(pd.DataFrame(TYPED_ROWS), None)       # no scan, no attributes.parquet
+    nodes = {n["id"]: n for n in graph["nodes"]}
+    assert {(n["model_id"], n["label"], n["field_count"]) for n in graph["nodes"] if n.get("member_kind") == "table"} == {(MODEL, "Sales", 1), (OTHER_MODEL_ID, "Sales", 1)}
+    links = {(nodes[e["source"]].get("full_name"), nodes[e["target"]]["label"], nodes[e["target"]].get("model_id")) for e in graph["edges"] if nodes[e["target"]].get("member_kind") == "table"}
+    assert ("ip.dbo.orders", "Sales", MODEL) in links                                # a source table -> the model's table
+    assert (f"powerbi-sandbox.{MODEL}.(model).Sales", "Sales", OTHER_MODEL_ID) in links    # a table -> the table of the model built on it
+
+
+# the layout of the bundles of 2026-11-12 23:45: /<sys>/powerbi/<id>…, every load a Data Process, field links written as maps_to
+V4_ROWS = [
+    _typed_row("read_by", f"{SQL}/orders", BI_PROC, "table", "dataprocess", BI_PROC),
+    _typed_row("read_by", f"{SQL}/orders/amount", BI_PROC, "column", "dataprocess", BI_PROC),
+    _typed_row("writes_to", BI_PROC, f"{PB}/m1/Sales", "dataprocess", "bitable", BI_PROC),
+    _typed_row("writes_to", BI_PROC, f"{PB}/m1/Sales/Amount", "dataprocess", "bifield", BI_PROC),
+    _typed_row("maps_to", f"{SQL}/orders/amount", f"{PB}/m1/Sales/Amount", "column", "bifield", BI_PROC),
+    _typed_row("read_by", f"{SQL}/orders", f"{PB}/m1", "table", "bimodel", None),               # the same load, rolled up to the model
+    _typed_row("read_by", f"{PB}/m1/Sales", f"{PB}/m2/Sales", "bitable", "bitable", None),
+    _typed_row("maps_to", f"{PB}/m1/Sales/Amount", f"{PB}/m2/Sales/Amount", "bifield", "bifield", None),
+    _typed_row("read_by", f"{PB}/m1", f"{PB}/m2", "bimodel", "bimodel", None),
+    _typed_row("maps_to", f"{PB}/m2/Sales/Amount", f"{PB}/m2/Total", "bifield", "bimeasure", None),
+    _typed_row("read_by", f"{PB}/m2", f"{PB}/r1", "bimodel", "bireport", None),
+]
+
+
+def test_a_load_process_feeds_the_table_of_the_model_and_the_tables_feed_the_next_models_tables():
+    graph = get_lineage_graph(pd.DataFrame(V4_ROWS), None)
+    nodes = {n["id"]: n for n in graph["nodes"]}
+    name = {i: n.get("full_name") or n["process_fqn"] for i, n in nodes.items()}
+    links = {(name[e["source"]], name[e["target"]], e["kind"]): bool(e.get("summary")) for e in graph["edges"]}
+    m1, m2 = "powerbi.m1.(model)", "powerbi.m2.(model)"
+    assert links == {
+        ("ip.dbo.orders", BI_PROC, "input"): False,
+        (BI_PROC, m1, "output"): True,                              # the roll-up of the load, for a closed model
+        (BI_PROC, f"{m1}.Sales", "output"): False,                  # the load of the table, for an open one
+        (f"{m1}.Sales", f"{m2}.Sales", "uses"): False,              # table -> table
+        (m1, m2, "uses"): True,                                     # …and their roll-up
+        (m2, "powerbi.(reports).r1", "uses"): False,
+        (f"{m2}.Sales_Amount", f"{m2}.Total", "direct"): False,    # only a maps_to says field -> measure
+    }                                                              # (no ip.dbo.orders -> m1: the process is how it gets there)
+    assert not [n for n in graph["nodes"] if n["type"] == "table" and n.get("asset_type") == "bitable"]   # no table is a node of its own
+
+
+# What each row of V4_ROWS says about itself: (confidence, resolution_type, fallback_reason)
+_FALLBACK = ("MEDIUM", "table_fallback", "column_unresolvable")
+_RESOLVED = ("MEDIUM", "column_resolved", None)
+_SURE = ("HIGH", "column_resolved", None)
+V4_SAYS = [_FALLBACK, _RESOLVED, _FALLBACK, _RESOLVED, _RESOLVED, _FALLBACK, _FALLBACK, _RESOLVED, _SURE, _SURE, _SURE]
+
+
+def _says(rows, says):
+    return pd.DataFrame([{**row, "confidence": c, "resolution_type": r, "fallback_reason": why} for row, (c, r, why) in zip(rows, says)])
+
+
+def _basis_of(graph, source, target):
+    """The (basis, weakest) of the link between two nodes, named by full_name / process_fqn."""
+    name = {n["id"]: n.get("full_name") or n.get("process_fqn") for n in graph["nodes"]}
+    edge = next(e for e in graph["edges"] if (name[e["source"]], name[e["target"]]) == (source, target))
+    return edge.get("basis"), edge.get("weakest")
+
+
+def _group(confidence, resolution_type, count, fallback_reason=None):
+    return {"confidence": confidence, "resolution_type": resolution_type, **({"fallback_reason": fallback_reason} if fallback_reason else {}), "count": count}
+
+
+def test_every_drawn_link_says_how_sure_the_pipeline_is_of_the_edges_behind_it():
+    graph = get_lineage_graph(_says(V4_ROWS, V4_SAYS), None)
+    m1, m2 = "powerbi.m1.(model)", "powerbi.m2.(model)"
+    fallback = _group("MEDIUM", "table_fallback", 1, "column_unresolvable")
+    # one edge behind the link between two tables
+    assert _basis_of(graph, f"{m1}.Sales", f"{m2}.Sales") == ([fallback], "MEDIUM")
+    assert _basis_of(graph, BI_PROC, f"{m1}.Sales") == ([fallback], "MEDIUM")
+    assert _basis_of(graph, m2 + ".Sales_Amount", m2 + ".Total") == ([_group("HIGH", "column_resolved", 1)], "HIGH")
+    assert _basis_of(graph, m2, "powerbi.(reports).r1") == ([_group("HIGH", "column_resolved", 1)], "HIGH")
+    # the link between the whole models rests on every edge between their tables and fields and the one between the models:
+    # listed weakest first, and it is as sure as the weakest of them
+    assert _basis_of(graph, m1, m2) == ([_group("MEDIUM", "column_resolved", 1), fallback, _group("HIGH", "column_resolved", 1)], "MEDIUM")
+    # the process that loads the table: its link to the whole model rests on the edges to the table and to its fields, and
+    # the link from the source table on the edges that read it
+    resolved_twice_and_fallback = [_group("MEDIUM", "column_resolved", 2), fallback]
+    assert _basis_of(graph, BI_PROC, m1) == (resolved_twice_and_fallback, "MEDIUM")
+    assert _basis_of(graph, "ip.dbo.orders", BI_PROC) == ([_group("MEDIUM", "column_resolved", 2), fallback], "MEDIUM")
+
+
+def test_a_bundle_without_confidence_gets_no_basis_and_one_that_says_nothing_gets_none_either():
+    assert not any("basis" in e or "weakest" in e for e in get_lineage_graph(pd.DataFrame(V4_ROWS), None)["edges"])
+    silent = pd.DataFrame([{**row, "confidence": None, "resolution_type": None, "fallback_reason": None} for row in V4_ROWS])
+    assert not any("basis" in e for e in get_lineage_graph(silent, None)["edges"])
+
+
+def test_a_level_the_pipeline_does_not_use_is_counted_but_never_called_the_weakest():
+    from services.analysis_svc import _basis, _weakest
+    says = [("WEIRD", None, None), ("HIGH", None, None), ("HIGH", None, None)]
+    assert _weakest(says) == "HIGH"                                  # only the levels it knows are ranked
+    assert _weakest([("WEIRD", None, None)]) is None
+    assert _basis(Counter(says)) == [{"confidence": "HIGH", "count": 2}, {"confidence": "WEIRD", "count": 1}]
+    assert _weakest([("LOW", None, None), ("high", None, None), ("MEDIUM", None, None)]) == "LOW"
+
+
+def test_the_data_mapping_links_carry_the_confidence_of_their_maps_to_edges():
+    graph = get_mapping_graph(_says(V4_ROWS, V4_SAYS))
+    name = {n["id"]: n["full_name"] for n in graph["nodes"]}
+    links = {(name[e["source"]], name[e["target"]]): (e["basis"], e["weakest"]) for e in graph["edges"]}
+    assert links == {
+        ("ip.dbo.orders", "powerbi.m1.(model)"): ([_group("MEDIUM", "column_resolved", 1)], "MEDIUM"),
+        ("powerbi.m1.(model)", "powerbi.m2.(model)"): ([_group("MEDIUM", "column_resolved", 1)], "MEDIUM"),
+    }
+
+
+def test_each_step_of_a_column_lineage_path_says_how_sure_the_pipeline_is_of_the_link_to_the_next():
+    says = list(V4_SAYS)
+    says[4] = ("LOW", "column_resolved", None)       # the source column -> the field of the first model
+    result = get_column_lineage(_says(V4_ROWS, says), None, "m2", "Sales")
+    (field,) = result["fields"]
+    # farthest first: the database column, then the field of m1, then (not drawn) m2's own: each with the link toward it
+    assert [(n["label"], n["link"]) for n in field["upstream"][0]] == [
+        ("ip.dbo.orders.amount", {"confidence": "LOW", "resolution_type": "column_resolved"}),
+        ("Sales[Amount]", {"confidence": "MEDIUM", "resolution_type": "column_resolved"}),
+    ]
+    assert field["measures"] == {"count": 1, "names": ["Total"], "confidence": "HIGH"}
+    first = get_column_lineage(_says(V4_ROWS, says), None, "m1", "Sales")["fields"][0]
+    assert first["downstream"][0][0]["link"] == {"confidence": "MEDIUM", "resolution_type": "column_resolved"}
+
+
+def test_when_two_edges_join_the_same_two_fields_the_step_shows_the_weaker_one():
+    rows = [_typed_row("maps_to", f"{PB}/m1/Sales/Amount", f"{PB}/m2/Sales/Amount", "bifield", "bifield", None)] * 2
+    says = [("HIGH", "column_resolved", None), ("LOW", "column_resolved", "derived_column")]
+    (field,) = get_column_lineage(_says(rows, says), None, "m1", "Sales")["fields"]
+    assert field["downstream"][0][0]["link"] == {"confidence": "LOW", "resolution_type": "column_resolved", "fallback_reason": "derived_column"}
+
+
+def test_column_lineage_without_confidence_has_no_links():
+    (field,) = get_column_lineage(pd.DataFrame(V4_ROWS), None, "m1", "Sales")["fields"]
+    assert "link" not in field["upstream"][0][0] and "link" not in field["downstream"][0][0]
+
+
+def test_column_lineage_follows_a_field_through_a_load_process_in_the_platform_layout():
+    result = get_column_lineage(pd.DataFrame(V4_ROWS), None, "m1", "Sales")      # the table comes from the edges: no attributes here
+    assert result is not None and result["type_names"] == {"table": "bitable", "field": "bifield"}
+    (field,) = result["fields"]
+    assert field["name"] == "Amount"
+    assert [[n["label"] for n in path] for path in field["upstream"]] == [["ip.dbo.orders.amount"]]      # the process is not a step of it
+    assert [[n["label"] for n in path] for path in field["downstream"]] == [["Sales[Amount]"]]
+    assert get_column_lineage(pd.DataFrame(V4_ROWS), None, "m2", "Sales")["fields"][0]["measures"] == {"count": 1, "names": ["Total"]}
 
 
 def test_typed_summary_counts_and_names_the_kinds_by_their_tags_including_dataflows():

@@ -64,6 +64,18 @@ def test_crawl_is_found_through_the_manifest_connection_id(tmp_path):
     assert find_crawl_folder(bundle, {"connectionId": CONNECTION}) == snap   # the folder above lineage/ works too
 
 
+def test_the_crawl_a_bundle_carries_is_used_before_the_crawl_metadata_folder(tmp_path):
+    make_crawl(tmp_path, snapshot="20261102000000000")                       # newer, in crawl-metadata
+    bundle = make_bundle(tmp_path)
+    own = bundle / "crawl" / CONNECTION / "crawl-own" / SNAPSHOT
+    _write(own, "semantic_model", [{"semantic_model_urn": "/m1", "semantic_model_name": "Own Copy", "container_urn": None}])
+    manifest = {"connectionId": CONNECTION}
+    assert find_crawl_folder(bundle / "lineage", manifest) == own and find_crawl_folder(bundle, manifest) == own
+    names, info = resolve_names(bundle / "lineage", manifest, None)
+    assert names.models["m1"][0] == "Own Copy" and info["status"] == "auto"
+    assert find_crawl_folder(bundle, {"connectionId": "conn-other"}) is None   # a copy of some other connection's crawl is not this bundle's
+
+
 def test_crawl_of_another_connection_or_without_connection_id_is_not_used(tmp_path):
     make_crawl(tmp_path, connection="conn-other")
     bundle = make_bundle(tmp_path)
@@ -158,8 +170,8 @@ def test_graph_nodes_get_names_and_context():
     tile = nodes["powerbi.d1.t1"]
     assert tile["label"] == "Revenue tile"
     assert tile["details"] == [{"label": "dashboard", "value": "Exec Dashboard"}, {"label": "workspace", "value": "Sales WS"}]
-    table = nodes["powerbi.m1.Sales Data"]
-    assert table["label"] == "Sales Data"                                # a data table already carries its own name
+    table = next(n for n in graph["nodes"] if n["type"] == "bi_member" and n["member_kind"] == "table" and n["model_id"] == "m1")
+    assert table["label"] == "Sales Data"                                # a table of a model already carries its own name
     assert table["details"] == [{"label": "semantic_model", "value": "Sales Model"}, {"label": "workspace", "value": "Sales WS"}]
     # m2 is not in the crawl: it keeps its id label and gets no details
     assert nodes["powerbi.m2.(model)"]["label"] == "m2" and "details" not in nodes["powerbi.m2.(model)"]
@@ -198,7 +210,8 @@ def test_graph_api_uses_the_crawl_found_next_to_the_bundle(client, tmp_path):
     graph = client.get("/api/lineage/graph", params={"folder": str(bundle)}).json()
     assert nodes_by_name(graph)["powerbi.m1.(model)"]["label"] == "Sales Model"
     mapping = client.get("/api/lineage/graph", params={"folder": str(bundle), "mode": "mapping"}).json()
-    assert nodes_by_name(mapping)["powerbi.m1.Sales Data"]["details"][0] == {"label": "semantic_model", "value": "Sales Model"}
+    assert nodes_by_name(mapping)["powerbi.m1.(model)"]["label"] == "Sales Model"
+    assert nodes_by_name(mapping)["powerbi.m1.(model)"]["details"][0] == {"label": "workspace", "value": "Sales WS"}
     assets = client.get("/api/lineage/assets", params={"folder": str(bundle)}).json()
     assert any(s.get("schema_label") == "Sales Model" for d in assets for s in d["schemas"])
     info = client.get("/api/lineage/bi-names", params={"folder": str(bundle)}).json()
@@ -448,7 +461,8 @@ def test_graph_api_lists_a_models_tables_and_their_links_from_the_scanner_result
     assert [(t["label"], t["field_count"], t["measure_count"]) for t in tables] == [("Date (UTC)", 1, 0), ("Sales", 2, 1)]
     into_tables = [(nodes[e["source"]]["full_name"], nodes[e["target"]]["label"]) for e in graph["edges"] if nodes[e["target"]].get("member_kind") == "table"]
     assert into_tables == [("ip.dbo.orders", "Sales")]       # the table-level link, not just the roll-up into the model
-    assert [(nodes[e["source"]]["full_name"], nodes[e["target"]]["full_name"]) for e in graph["edges"] if e.get("summary")] == [("ip.dbo.orders", f"powerbi.{MODEL}.(model)")]
+    # the refresh process already takes orders to the model, so the bundle's own table -> model edge is not drawn as a second path
+    assert not [e for e in graph["edges"] if (nodes[e["source"]].get("full_name"), nodes[e["target"]].get("full_name")) == ("ip.dbo.orders", f"powerbi.{MODEL}.(model)")]
 
 
 def test_the_tables_come_from_the_scanner_result_and_only_without_it_from_the_attributes(client, tmp_path):

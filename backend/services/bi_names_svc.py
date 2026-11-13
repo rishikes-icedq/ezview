@@ -10,7 +10,9 @@ id. Their names come from two places:
       crawl-metadata/powerbi/<connectionId>/crawl-<id>/<snapshot timestamp>/
 
   The bundle's manifest.json carries the same connectionId, so the snapshot can be
-  found next to the bundle. It can also be given by hand.
+  found next to the bundle (a bundle may also carry a copy of it, as
+  `<bundle>/crawl/<connectionId>/crawl-<id>/<snapshot timestamp>/`, which is used first).
+  It can also be given by hand.
 * the bundle's own scanner result (`stage2/powerbi_scan_result.parquet`, the raw
   Power BI Scanner API response a live-scanner bundle was built from), which names
   every asset the lineage was built from.
@@ -36,6 +38,7 @@ from services.parquet_svc import read_df
 logger = logging.getLogger(__name__)
 
 CRAWL_METADATA_DIR = "crawl-metadata"
+BUNDLE_CRAWL_DIR = "crawl"      # a bundle's own copy of its crawl: <bundle>/crawl/<connectionId>/crawl-<id>/<snapshot>
 SCAN_FILE = Path("stage2") / "powerbi_scan_result.parquet"
 # Any one of these makes a folder a crawl snapshot.
 _FAMILIES = ("semantic_model", "report", "dashboard", "tile", "container")
@@ -127,11 +130,15 @@ def resolve_snapshot(path: Path) -> Path | None:
 
 def find_crawl_folder(bundle_dir: Path, manifest: dict | None) -> Path | None:
     """The snapshot of the crawl this bundle was built from, looked up through the
-    bundle manifest's connectionId in a `crawl-metadata` folder next to (or above) it."""
+    bundle manifest's connectionId: in the `crawl/<connectionId>` copy a bundle may carry
+    of its own crawl, or in a `crawl-metadata` folder, next to (or above) the bundle."""
     connection_id = str((manifest or {}).get("connectionId") or "").strip()
     if not connection_id:
         return None
     for folder in [bundle_dir, *list(bundle_dir.parents)[:_MAX_PARENTS]]:
+        own_copy = resolve_snapshot(folder / BUNDLE_CRAWL_DIR / connection_id)
+        if own_copy:
+            return own_copy
         root = folder / CRAWL_METADATA_DIR
         if not root.is_dir():
             continue
