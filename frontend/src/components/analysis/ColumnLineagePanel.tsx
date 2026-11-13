@@ -1,7 +1,9 @@
 import { Fragment, useEffect, useMemo, useState } from 'react'
 import { ArrowDown, ArrowRight, ArrowUp, Columns3, Loader2, Search, Sigma, Sheet, X } from 'lucide-react'
 import { getColumnLineage } from '../../api/lineage'
-import type { ColumnLineage, ColumnLineageField, ColumnLineageNode } from '../../types'
+import { confidenceColor } from '../../utils/format'
+import { hopTooltip, levelRank, levelText, weakestLevel } from '../../utils/confidence'
+import type { ColumnLineage, ColumnLineageField, ColumnLineageNode, EdgeSays } from '../../types'
 
 interface Props {
   folder: string
@@ -35,15 +37,49 @@ function NodeChip({ node }: { node: ColumnLineageNode }) {
   )
 }
 
-function Chain({ path }: { path: ColumnLineageNode[] }) {
+/** One step of a path. Its colour is the `confidence` the data gives that edge and hovering it says what it says. */
+function Hop({ says }: { says?: EdgeSays }) {
+  return (
+    <span
+      title={hopTooltip(says)}
+      data-confidence={says?.confidence}
+      className={`inline-flex shrink-0 px-0.5 ${says?.confidence ? levelText(says.confidence) : 'text-slate-400'}`}
+    >
+      <ArrowRight size={11} aria-hidden="true" />
+    </span>
+  )
+}
+
+/** The field the path belongs to, at its end (upstream) or start (downstream): the arrow next to it is the last or first step. */
+function FieldEnd() {
+  return (
+    <span className="inline-flex items-center gap-1 rounded border border-dashed border-slate-400 dark:border-slate-600 px-1.5 py-0.5 text-[11px] leading-tight italic text-slate-500 dark:text-slate-400">
+      this field
+    </span>
+  )
+}
+
+/**
+ * A path as a chain of chips joined by arrows, ending at (upstream) or starting from (downstream) the field itself. A
+ * node says what the data says about the edge that joins it to the node on the field's side of it, so that arrow is
+ * drawn after it upstream and before it downstream; the badge is the weakest `confidence` along the path.
+ */
+function Chain({ path, direction }: { path: ColumnLineageNode[]; direction: 'up' | 'down' }) {
+  const weakest = weakestLevel(path.map(n => n.link?.confidence))
   return (
     <div className="flex flex-wrap items-center gap-x-1 gap-y-1">
+      {direction === 'down' && <><FieldEnd /><Hop says={path[0]?.link} /></>}
       {path.map((n, i) => (
         <Fragment key={i}>
-          {i > 0 && <ArrowRight size={11} className="shrink-0 text-slate-400" aria-hidden="true" />}
+          {direction === 'down' && i > 0 && <Hop says={n.link} />}
           <NodeChip node={n} />
+          {direction === 'up' && <Hop says={n.link} />}
         </Fragment>
       ))}
+      {direction === 'up' && <FieldEnd />}
+      {weakest && (
+        <span className={`ml-1 text-[9px] px-1 rounded ${confidenceColor(weakest)}`} title="confidence: the weakest of the links on this path">{weakest}</span>
+      )}
     </div>
   )
 }
@@ -65,7 +101,7 @@ function FieldRow({ field, table, typeNames }: { field: ColumnLineageField; tabl
           <span className="flex items-center gap-0.5 shrink-0 w-14 pt-0.5 text-[10px] uppercase tracking-wide text-slate-500" title="Where this field comes from">
             <ArrowUp size={11} /> from
           </span>
-          <div className="flex flex-col gap-1 min-w-0">{field.upstream.map((p, i) => <Chain key={i} path={p} />)}</div>
+          <div className="flex flex-col gap-1 min-w-0">{field.upstream.map((p, i) => <Chain key={i} path={p} direction="up" />)}</div>
         </div>
       )}
       {field.downstream.length > 0 && (
@@ -73,7 +109,7 @@ function FieldRow({ field, table, typeNames }: { field: ColumnLineageField; tabl
           <span className="flex items-center gap-0.5 shrink-0 w-14 pt-0.5 text-[10px] uppercase tracking-wide text-slate-500" title="Where this field goes">
             <ArrowDown size={11} /> to
           </span>
-          <div className="flex flex-col gap-1 min-w-0">{field.downstream.map((p, i) => <Chain key={i} path={p} />)}</div>
+          <div className="flex flex-col gap-1 min-w-0">{field.downstream.map((p, i) => <Chain key={i} path={p} direction="down" />)}</div>
         </div>
       )}
       {field.measures && (
@@ -86,6 +122,9 @@ function FieldRow({ field, table, typeNames }: { field: ColumnLineageField; tabl
             {': '}
             {field.measures.names.join(', ')}
             {field.measures.count > field.measures.names.length && <span className="text-slate-500">, … +{field.measures.count - field.measures.names.length} more</span>}
+            {field.measures.confidence && (
+              <span className={`ml-1.5 text-[9px] px-1 rounded ${confidenceColor(field.measures.confidence)}`} title="confidence: the weakest of the edges to these measures">{field.measures.confidence}</span>
+            )}
           </div>
         </div>
       )}
@@ -119,6 +158,12 @@ export default function ColumnLineagePanel({ folder, crawl, modelId, table, onCl
     return data ? data.fields.filter(f => !q || f.name.toLowerCase().includes(q)) : []
   }, [data, filter])
 
+  // The confidence levels the arrows carry, weakest first: the key to their colours.
+  const levels = useMemo(() => {
+    const found = new Set<string>()
+    for (const f of data?.fields ?? []) for (const path of [...f.upstream, ...f.downstream]) for (const n of path) if (n.link?.confidence) found.add(n.link.confidence)
+    return [...found].sort((a, b) => (levelRank(a) ?? 9) - (levelRank(b) ?? 9))
+  }, [data])
   const withUp = data?.fields.filter(f => f.upstream.length > 0).length ?? 0
   const withDown = data?.fields.filter(f => f.downstream.length > 0 || f.measures).length ?? 0
 
@@ -148,6 +193,15 @@ export default function ColumnLineagePanel({ folder, crawl, modelId, table, onCl
           <X size={16} />
         </button>
       </header>
+
+      {levels.length > 0 && (
+        <div data-testid="column-lineage-key" className="shrink-0 flex flex-wrap items-center gap-x-3 gap-y-0.5 px-4 py-1.5 border-b border-slate-200 dark:border-slate-800 text-[10px] text-slate-500">
+          <span title="Each arrow is coloured by the confidence the data gives that edge. Hover an arrow for what it says.">confidence of each link:</span>
+          {levels.map(level => (
+            <span key={level} className="inline-flex items-center gap-0.5"><span className={levelText(level)} aria-hidden="true">→</span>{level}</span>
+          ))}
+        </div>
+      )}
 
       {data && data.fields.length > 8 && (
         <div className="shrink-0 px-4 py-2 border-b border-slate-200 dark:border-slate-800">

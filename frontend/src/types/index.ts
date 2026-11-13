@@ -98,23 +98,12 @@ export interface AssetDatabase {
   schemas: AssetSchema[]
 }
 
-export interface EdgeRow {
-  edge_id: string
-  edge: string
-  source_fqn: string
-  source_type: string
-  target_fqn: string
-  target_type: string
-  process_fqn: string
-  transform_type: string
-  expression: string
-  confidence: string
-  resolution_type: string
-  is_temporary_source: boolean | string
-  is_temporary_target: boolean | string
-}
+/** One row of edges.parquet: every column of the file, under the file's own names (an empty value is ""). */
+export type EdgeRow = Record<string, string | number | boolean | null>
 
 export interface EdgePage {
+  /** Every column of the file, in its order. */
+  columns: string[]
   rows: EdgeRow[]
   total: number
   page: number
@@ -192,6 +181,21 @@ export interface LineageGraphNode {
   fqn?: string
 }
 
+/**
+ * What some of a drawn link's data edges say about themselves: how many say the same `confidence`, `resolution_type` and
+ * `fallback_reason` (any the data leaves empty is left out). A link may stand for many edges, e.g. the one between two
+ * closed models is the roll-up of all their table and field edges.
+ */
+export interface ConfidenceBasis {
+  confidence?: string
+  resolution_type?: string
+  fallback_reason?: string
+  count: number
+}
+
+/** What the data says about one edge. */
+export type EdgeSays = Omit<ConfidenceBasis, 'count'>
+
 export interface LineageGraphEdge {
   source: string
   target: string
@@ -211,6 +215,10 @@ export interface LineageGraphEdge {
    * out once one is open, because the table links are drawn instead.
    */
   summary?: boolean
+  /** What the data edges behind this link say about how sure the pipeline is of them, weakest first (absent if they say nothing). */
+  basis?: ConfidenceBasis[]
+  /** The weakest `confidence` level among them, as the data writes it. */
+  weakest?: string
 }
 
 /**
@@ -236,6 +244,11 @@ export interface ColumnLineageNode {
   label: string
   /** The model a field belongs to (null for a database column). */
   model: string | null
+  /**
+   * What the data says about the edge that joins this node to the one on the field's side of it: the one that reads it,
+   * in an upstream path, or the one it is read by, in a downstream path (so each arrow in a chain has one).
+   */
+  link?: EdgeSays
 }
 
 export interface ColumnLineageField {
@@ -245,7 +258,7 @@ export interface ColumnLineageField {
   /** Where it goes: each path runs outward from the nearest. */
   downstream: ColumnLineageNode[][]
   /** The measures that read it directly. */
-  measures?: { count: number; names: string[] }
+  measures?: { count: number; names: string[]; /** The weakest `confidence` among the edges to them. */ confidence?: string }
 }
 
 /** Where the fields of one table of a Power BI model come from and where they go. */

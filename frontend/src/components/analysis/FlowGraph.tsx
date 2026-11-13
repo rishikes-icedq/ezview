@@ -5,13 +5,15 @@ import {
   type Node, type Edge, type NodeProps, type ReactFlowInstance, type FitViewOptions,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { Loader2, Table2, Layers, Cpu, Boxes, Box, Sheet, BarChart3, LayoutDashboard, PanelTop, ChevronDown, ChevronUp, Crosshair, RotateCcw, MousePointerClick, Maximize2, Minimize2, Sigma, Columns3, Workflow, type LucideIcon } from 'lucide-react'
+import { Loader2, Table2, Layers, Cpu, Boxes, Box, Sheet, BarChart3, LayoutDashboard, PanelTop, ChevronDown, ChevronUp, Crosshair, RotateCcw, MousePointerClick, Maximize2, Minimize2, Sigma, Columns3, Workflow, ShieldCheck, type LucideIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import { getGraph } from '../../api/lineage'
 import ColumnLineagePanel from './ColumnLineagePanel'
+import LineageEdge, { type LineageEdgeData } from './LineageEdge'
 import { useTheme } from '../../contexts/ThemeContext'
 import { focusLineage, type FocusScope } from '../../utils/lineageFocus'
-import { layoutLineage, EDGE_COLOR, TABLE_WIDTH, TABLE_HEIGHT, PROCESS_WIDTH, PROCESS_HEIGHT, SP_HEADER_HEIGHT, MEMBER_HEIGHT } from './flowLayout'
+import { levelRank } from '../../utils/confidence'
+import { layoutLineage, DIMMED_OPACITY, EDGE_COLOR, TABLE_WIDTH, TABLE_HEIGHT, PROCESS_WIDTH, PROCESS_HEIGHT, SP_HEADER_HEIGHT, MEMBER_HEIGHT } from './flowLayout'
 import type { BiAssetType, GraphMode, LineageGraph } from '../../types'
 
 interface Props {
@@ -409,6 +411,7 @@ function StoredProcedureNode({ id, data }: NodeProps<Node<{ label: string; fqn?:
 }
 
 const NODE_TYPES = { table: TableNode, process: ProcessNode, stored_procedure: StoredProcedureNode, bi_member: BiMemberNode }
+const EDGE_TYPES = { lineage: LineageEdge }
 
 function Legend({ hasViews, biAssets, memberKinds, hasDirect, hasStoredProcedures, hasCalls, mode }: {
   hasViews: boolean
@@ -468,7 +471,7 @@ function Legend({ hasViews, biAssets, memberKinds, hasDirect, hasStoredProcedure
             writes_to
           </span>
           {hasDirect && (
-            <span className="flex items-center gap-1.5" title="maps_to: a view has no process, so it is linked straight to what it maps from">
+            <span className="flex items-center gap-1.5" title="maps_to: the one on the left maps to the one on the right, with no process in between">
               <svg width="22" height="6" aria-hidden="true"><line x1="0" y1="3" x2="22" y2="3" stroke={EDGE_COLOR.direct} strokeWidth="2" /></svg>
               maps_to
             </span>
@@ -498,6 +501,68 @@ interface CanvasProps {
   fitNodeIds?: string[]
   maximized: boolean
   onToggleMaximized: () => void
+  /** The confidence levels the links of this graph carry, weakest first, and how they are shown (see ConfidenceControls). */
+  confidence: ConfidenceView
+}
+
+/** How the graph shows confidence: the levels its links carry (weakest first), the lowest one left un-faded, and whether each link says its own. */
+interface ConfidenceView {
+  levels: string[]
+  min: string | null
+  onMin: (level: string | null) => void
+  show: boolean
+  onShow: (show: boolean) => void
+}
+
+/**
+ * Applies the confidence view to the drawn links: those whose weakest level is below `min` are faded (the same fading as
+ * what is off the path of a focused table), and with `show` each link says its weakest level (after any label it has).
+ * Links the data says nothing about are left as they are.
+ */
+function withConfidence(edges: Edge[], min: string | null, show: boolean): Edge[] {
+  if (!min && !show) return edges
+  const floor = min ? levelRank(min) : undefined
+  return edges.map(e => {
+    const weakest = (e.data as LineageEdgeData | undefined)?.weakest
+    const rank = levelRank(weakest)
+    const below = floor !== undefined && rank !== undefined && rank < floor
+    if (!below && !(show && weakest)) return e
+    return {
+      ...e,
+      ...(show && weakest && { label: e.label ? `${e.label} · ${weakest}` : weakest, labelStyle: { fontSize: 10, fontWeight: 600 } }),
+      ...(below && { animated: false, style: { ...e.style, opacity: DIMMED_OPACITY } }),
+    }
+  })
+}
+
+/** Top-right of the graph: fade the links below a confidence level, and/or write each link's confidence on it. */
+function ConfidenceControls({ view }: { view: ConfidenceView }) {
+  if (view.levels.length === 0) return null
+  return (
+    <div
+      data-testid="confidence-controls"
+      className="flex items-center gap-1.5 h-8 px-2 rounded-md border border-slate-300 dark:border-slate-700 bg-white/90 dark:bg-slate-900/90 text-[11px] text-slate-600 dark:text-slate-300 shadow-sm"
+    >
+      <ShieldCheck size={13} aria-hidden="true" />
+      <span title="confidence: how sure the pipeline is of an edge. Hover a link to see what its edges say.">confidence</span>
+      {view.levels.length > 1 && (
+        <select
+          aria-label="Fade the links with a confidence below"
+          title="Fade the links whose weakest confidence is below this level"
+          value={view.min ?? ''}
+          onChange={e => view.onMin(e.target.value || null)}
+          className="bg-transparent text-[11px] outline-none cursor-pointer"
+        >
+          <option value="">all</option>
+          {view.levels.slice(1).map(level => <option key={level} value={level}>≥ {level}</option>)}
+        </select>
+      )}
+      <label className="flex items-center gap-1 cursor-pointer" title="Write each link's confidence on the link">
+        <input type="checkbox" checked={view.show} onChange={e => view.onShow(e.target.checked)} />
+        on links
+      </label>
+    </div>
+  )
 }
 
 /** Maximize / restore button in the graph's top-right corner: the same icon spot in both states, like a map's full-screen control. */
@@ -559,7 +624,7 @@ function RefitOnMaximizeChange({ maximized, options }: { maximized: boolean; opt
 // which arrives here as new `nodes`/`edges` props that replace the state (dragging is dropped
 // as above). The viewport is left alone, except that it is shifted so the box that was
 // clicked stays where it was on screen instead of being carried off by the new layout.
-function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableClick, onToggleContainer, onTableChipClick, fitNodeIds, maximized, onToggleMaximized }: CanvasProps) {
+function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableClick, onToggleContainer, onTableChipClick, fitNodeIds, maximized, onToggleMaximized, confidence }: CanvasProps) {
   const { theme } = useTheme()
   // Room at the top keeps the legend (top-left, over the canvas) clear of the content. (A plain number is a ratio that
   // works out to only ~6% of the height, less than the legend's.)
@@ -569,15 +634,24 @@ function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableCl
   const flow = useRef<ReactFlowInstance | null>(null)
   const anchor = useRef<{ id: string; x: number; y: number } | null>(null)
 
-  const mounted = useRef(false)
+  // New nodes come with a new layout; new edges also with a change of how confidence is shown, which must not undo
+  // what has been dragged, so they are seeded apart.
+  const nodesSeeded = useRef(false)
   useEffect(() => {
-    if (!mounted.current) {
-      mounted.current = true
+    if (!nodesSeeded.current) {
+      nodesSeeded.current = true
       return
     }
     setNodes(initialNodes)
+  }, [initialNodes, setNodes])
+  const edgesSeeded = useRef(false)
+  useEffect(() => {
+    if (!edgesSeeded.current) {
+      edgesSeeded.current = true
+      return
+    }
     setEdges(initialEdges)
-  }, [initialNodes, initialEdges, setNodes, setEdges])
+  }, [initialEdges, setEdges])
 
   // Runs once the re-laid-out nodes are in place: put the clicked box back where it was on screen.
   useEffect(() => {
@@ -619,6 +693,7 @@ function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableCl
         }
       }}
       nodeTypes={NODE_TYPES}
+      edgeTypes={EDGE_TYPES}
       colorMode={theme}
       // Default is 0: any mouse movement between press and release counts as a
       // drag and swallows the click, which a real mouse/trackpad nearly always
@@ -638,7 +713,10 @@ function GraphCanvas({ nodes: initialNodes, edges: initialEdges, mode, onTableCl
       <MiniMap pannable zoomable />
       <RefitOnMaximizeChange maximized={maximized} options={fitOptions} />
       <Panel position="top-right">
-        <MaximizeButton maximized={maximized} onToggle={onToggleMaximized} />
+        <div className="flex items-center gap-2">
+          <ConfidenceControls view={confidence} />
+          <MaximizeButton maximized={maximized} onToggle={onToggleMaximized} />
+        </div>
       </Panel>
       <Panel position="top-left">
         <Legend
@@ -713,6 +791,23 @@ export default function FlowGraph({ folder, crawl, focusTable, onFocusChange, fo
 
   const isMapping = graphMode === 'mapping'
   const shown = focusTable ? focusedLayout : fullLayout
+
+  // Confidence: the levels the links of this graph carry, the one below which links are faded, and whether links say theirs.
+  const [minConfidence, setMinConfidence] = useState<string | null>(null)
+  const [showConfidence, setShowConfidence] = useState(false)
+  useEffect(() => { setMinConfidence(null) }, [folder])
+  const confidenceLevels = useMemo(() => {
+    const found = new Set<string>()
+    for (const e of shown?.edges ?? []) {
+      const level = (e.data as LineageEdgeData | undefined)?.weakest
+      if (level) found.add(level)
+    }
+    return [...found].sort((a, b) => levelRank(a)! - levelRank(b)!)
+  }, [shown])
+  const shownEdges = useMemo(
+    () => (shown ? withConfidence(shown.edges, confidenceLevels.includes(minConfidence ?? '') ? minConfidence : null, showConfidence) : []),
+    [shown, minConfidence, showConfidence, confidenceLevels],
+  )
   const graphEmpty = !loading && !error && !!graph && graph.nodes.length === 0
   // The path's processes may be folded into a collapsed box, so frame only nodes that are actually drawn.
   const fitNodeIds = useMemo(() => {
@@ -764,7 +859,7 @@ export default function FlowGraph({ folder, crawl, focusTable, onFocusChange, fo
               <GraphCanvas
                 key={`${folder}|${graphMode}|${focusTable ?? ''}|${focusTable ? focusScope : ''}`}
                 nodes={shown.nodes}
-                edges={shown.edges}
+                edges={shownEdges}
                 mode={graphMode}
                 onTableClick={onFocusChange}
                 onToggleContainer={toggleContainer}
@@ -772,6 +867,7 @@ export default function FlowGraph({ folder, crawl, focusTable, onFocusChange, fo
                 fitNodeIds={fitNodeIds}
                 maximized={maximized}
                 onToggleMaximized={() => onMaximizedChange?.(!maximized)}
+                confidence={{ levels: confidenceLevels, min: minConfidence, onMin: setMinConfidence, show: showConfidence, onShow: setShowConfidence }}
               />
             </SelectedChipContext.Provider>
           </div>

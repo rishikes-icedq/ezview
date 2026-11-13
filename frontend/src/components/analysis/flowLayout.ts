@@ -1,7 +1,8 @@
 import dagre from '@dagrejs/dagre'
 import { MarkerType, Position, type Node, type Edge } from '@xyflow/react'
 import { edgeKey } from '../../utils/lineageFocus'
-import type { LineageGraph, LineageGraphEdge, LineageGraphNode } from '../../types'
+import { mergeBasis, weakestLevel } from '../../utils/confidence'
+import type { ConfidenceBasis, LineageGraph, LineageGraphEdge, LineageGraphNode } from '../../types'
 
 // How faded items are when shown for context but not directly upstream/downstream of the focused table.
 export const DIMMED_OPACITY = 0.35
@@ -89,6 +90,10 @@ interface DisplayEdge {
   target: string
   kind: LineageGraphEdge['kind']
   column_count?: number
+  /** What the data edges behind this link say about their confidence (several edges that land on one pair are added up). */
+  basis?: ConfidenceBasis[]
+  /** The basis of the roll-up link between whole models, which already counts the edges of the table links that fold into it. */
+  rolledUp?: ConfidenceBasis[]
   onPath: boolean
   /** Ends at a table, measure or field inside an open model: drawn above that box's background but below them. */
   inside: boolean
@@ -265,12 +270,28 @@ export function layoutLineage(
   for (const [s, t] of layoutEdges.values()) g.setEdge(s, t)
   dagre.layout(g)
 
-  // A source table that feeds only the tables of one open model is put in the order of the tables it feeds, taking over
-  // the places dagre gave these sources (so nothing moves closer to a neighbour): the links then fan in without crossing.
+  // A source table (or a process that loads the table of a model) that feeds only the tables of one open model is put in
+  // the order of the tables it feeds, taking over the places dagre gave these sources (so nothing moves closer to a
+  // neighbour): the links then fan in without crossing. The source tables that only feed those processes follow them.
   const partners = new Map<string, Set<string>>()
+  const feedsOnly = new Map<string, Set<string>>()   // layout node -> the layout nodes it feeds
   for (const [s, t] of layoutEdges.values()) {
     partners.set(s, (partners.get(s) ?? new Set()).add(t))
     partners.set(t, (partners.get(t) ?? new Set()).add(s))
+    feedsOnly.set(s, (feedsOnly.get(s) ?? new Set()).add(t))
+  }
+  /** Moves each node of `follows` into the place, among those of its column, that matches where the node it follows is. */
+  const follow = (follows: Map<string, string>, yOf: (followed: string) => number) => {
+    const ranks = new Map<number, string[]>()
+    for (const id of follows.keys()) {
+      const x = Math.round(g.node(id).x)
+      ranks.set(x, [...(ranks.get(x) ?? []), id])
+    }
+    for (const ids of ranks.values()) {
+      const places = ids.map(id => g.node(id).y).sort((a, b) => a - b)
+      const inOrder = [...ids].sort((a, b) => yOf(follows.get(a)!) - yOf(follows.get(b)!))
+      inOrder.forEach((id, i) => { g.node(id).y = places[i] })
+    }
   }
   for (const [containerId, box] of models) {
     const feeds = new Map<string, string>()   // source node -> the table of this model it feeds
@@ -278,19 +299,20 @@ export function layoutLineage(
       if (e.summary) continue
       const from = byId.get(e.source)
       const into = byId.get(e.target)
-      if (into?.member_kind !== 'table' || into.parent_id !== containerId || from?.type !== 'table' || feeds.has(from.id)) continue
-      if (partners.get(from.id)?.size === 1) feeds.set(from.id, into.id)
+      if (into?.member_kind !== 'table' || into.parent_id !== containerId || !from || feeds.has(from.id)) continue
+      // A source table has nothing else to feed; a process may be fed by others but must feed only this model.
+      const onlyHere = from.type === 'table' ? partners.get(from.id)?.size === 1
+        : from.type === 'process' && g.hasNode(from.id) && feedsOnly.get(from.id)?.size === 1 && feedsOnly.get(from.id)!.has(containerId)
+      if (onlyHere) feeds.set(from.id, into.id)
     }
-    const ranks = new Map<number, string[]>()
-    for (const id of feeds.keys()) {
-      const x = Math.round(g.node(id).x)
-      ranks.set(x, [...(ranks.get(x) ?? []), id])
+    follow(feeds, chip => box.positions.get(chip)?.y ?? 0)
+    // The tables that feed just one of those processes: in the order of the processes.
+    const loads = new Map<string, string>()
+    for (const e of graph.edges) {
+      const from = byId.get(e.source)
+      if (from?.type === 'table' && feeds.has(e.target) && !loads.has(from.id) && partners.get(from.id)?.size === 1) loads.set(from.id, e.target)
     }
-    for (const ids of ranks.values()) {
-      const places = ids.map(id => g.node(id).y).sort((a, b) => a - b)
-      const inOrder = [...ids].sort((a, b) => (box.positions.get(feeds.get(a)!)?.y ?? 0) - (box.positions.get(feeds.get(b)!)?.y ?? 0))
-      inOrder.forEach((id, i) => { g.node(id).y = places[i] })
-    }
+    follow(loads, process => g.node(process).y)
   }
 
   // The focused table is often one of very many inputs to a process (e.g. 1 of 148), and
@@ -439,8 +461,16 @@ export function layoutLineage(
     const onPath = !path || path.edgeKeys.has(edgeKey(e))
     const inside = drawnInside(source, e.source) || drawnInside(target, e.target)
     const seen = display.get(key)
-    if (seen) seen.onPath ||= onPath
-    else display.set(key, { source, target, kind: e.kind, column_count: e.column_count, onPath, inside })
+    if (seen) {
+      seen.onPath ||= onPath
+      if (e.basis && e.summary) seen.rolledUp = e.basis
+      else if (e.basis) seen.basis = mergeBasis(seen.basis, e.basis)
+    } else {
+      display.set(key, {
+        source, target, kind: e.kind, column_count: e.column_count, onPath, inside,
+        ...(e.summary ? { rolledUp: e.basis } : { basis: e.basis }),
+      })
+    }
   }
 
   const edges: Edge[] = [...display.values()].map((e, i) => {
@@ -449,12 +479,14 @@ export function layoutLineage(
     const isOutput = e.kind === 'output'
     // Mapping edges say how many columns are mapped; skipped on dimmed ones to keep a big graph legible.
     const label = e.kind === 'mapping' && e.column_count && !dimmed ? plural(e.column_count, 'col') : undefined
+    // Closed, a model's table links fold into the link between the models, whose basis already counts their edges: not twice.
+    const basis = e.rolledUp ?? e.basis
     return {
       id: `e${i}`,
       source: e.source,
       target: e.target,
-      type: 'default',
-      data: { kind: e.kind },
+      type: 'lineage',
+      data: { kind: e.kind, basis, weakest: weakestLevel((basis ?? []).map(g => g.confidence)) },
       ...(label && { label }),
       // Output edges are dashed via React Flow's `animated`. Dimmed ones keep the
       // dashes but stand still, so a big graph isn't dozens of running animations.

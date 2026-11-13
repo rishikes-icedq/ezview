@@ -1,15 +1,21 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Loader2, Filter, ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
 import { getEdges } from '../../api/lineage'
-import type { EdgePage, SortDirection } from '../../types'
+import type { EdgePage, EdgeRow, SortDirection } from '../../types'
 import { confidenceColor } from '../../utils/format'
 import FqnCell from '../viewers/FqnCell'
 import ColResizeHandle from '../shared/ColResizeHandle'
-import { useResizableColumns } from '../../hooks/useResizableColumns'
+import { useColumnWidths } from '../../hooks/useResizableColumns'
 
-const COLUMNS = ['Direction', 'Source', 'Source Type', 'Target', 'Target Type', 'Transform', 'Confidence', 'Resolution']
-const INITIAL_WIDTHS = [130, 260, 130, 260, 130, 140, 110, 140]
 const SEARCH_DEBOUNCE_MS = 350
+
+/** Where a column starts: wide for what is long (a name, a query), narrow for a flag or a level. Any column can be dragged wider. */
+const COLUMN_WIDTH: Record<string, number> = {
+  edge: 120, source_fqn: 260, target_fqn: 260, process_fqn: 260, edge_id: 200, expression: 280,
+  source_type: 130, target_type: 130, transform_type: 140, confidence: 110, resolution_type: 140, fallback_reason: 160,
+}
+const defaultWidth = (column: string) =>
+  COLUMN_WIDTH[column] ?? (column.endsWith('_at') ? 190 : column.startsWith('is_') ? 150 : column.endsWith('_fqn') ? 260 : 150)
 
 type SortCol = 'source_fqn' | 'target_fqn' | ''
 
@@ -30,13 +36,37 @@ const EMPTY_FILTERS: Filters = {
   sourceSearch: '', targetSearch: '', sortBy: '', sortDir: 'asc',
 }
 
+/** A value of the file as it is: a flag as true/false, a missing value as a dash. */
+function Cell({ column, value }: { column: string; value: EdgeRow[string] }) {
+  const text = value === null || value === undefined ? '' : String(value)
+  if (column === 'edge' && text) {
+    return (
+      <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${text === 'writes_to' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
+        {text}
+      </span>
+    )
+  }
+  if (column === 'confidence' && text) return <span className={`text-xs px-1.5 py-0.5 rounded ${confidenceColor(text)}`}>{text}</span>
+  if (column.endsWith('_fqn')) return <FqnCell value={text} />
+  if (!text) return <span className="text-slate-300 dark:text-slate-700">—</span>
+  const plain = /_type$|_reason$/.test(column)
+  return (
+    <span
+      className={`block truncate ${plain ? 'text-slate-500 dark:text-slate-400' : 'font-mono text-slate-700 dark:text-slate-300'}`}
+      title={text}
+    >
+      {text}
+    </span>
+  )
+}
+
 interface Props { folder: string }
 
 export default function EdgeTable({ folder }: Props) {
   const [data, setData] = useState<EdgePage | null>(null)
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
   const [loading, setLoading] = useState(true)
-  const { widths, startResize } = useResizableColumns(INITIAL_WIDTHS)
+  const { widthOf, startResize } = useColumnWidths(defaultWidth)
   const searchTimers = useRef<{ source?: number; target?: number }>({})
 
   const load = useCallback((p: number, f: Filters) => {
@@ -91,6 +121,8 @@ export default function EdgeTable({ folder }: Props) {
   const clearFilters = () => { setFilters(EMPTY_FILTERS); load(1, EMPTY_FILTERS) }
 
   const opts = data
+  const columns = data?.columns ?? []
+  const tableWidth = columns.reduce((sum, c) => sum + widthOf(c), 0)
   const selectClass = "bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs rounded px-2 py-1 border border-slate-300 dark:border-slate-700 focus:outline-none focus:border-indigo-500"
   const headerSelectClass = "mt-1 w-full max-w-full bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 text-[10px] font-normal normal-case rounded px-1 py-0.5 border border-slate-300 dark:border-slate-700 focus:outline-none focus:border-indigo-500"
   const headerInputClass = "mt-1 w-full max-w-full bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 text-[10px] font-normal normal-case rounded px-1 py-0.5 border border-slate-300 dark:border-slate-700 focus:outline-none focus:border-indigo-500 placeholder:text-slate-400 dark:placeholder:text-slate-600"
@@ -117,8 +149,8 @@ export default function EdgeTable({ folder }: Props) {
         </select>
         <button onClick={applyFilters} className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 py-1 rounded transition-colors">Apply</button>
         <button onClick={clearFilters} className="text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 text-xs px-2 py-1 rounded border border-slate-300 dark:border-slate-700 transition-colors">Clear</button>
-        <span className="text-slate-400 dark:text-slate-600 text-xs italic">Direction / Source / Source Type / Target / Target Type filter directly in the column headers below</span>
-        {data && <span className="ml-auto text-slate-500 text-xs">{data.total.toLocaleString()} edges</span>}
+        <span className="text-slate-400 dark:text-slate-600 text-xs italic">edge, source_fqn, source_type, target_fqn and target_type filter directly in the column headers below</span>
+        {data && <span className="ml-auto text-slate-500 text-xs" data-testid="edge-counts">{data.total.toLocaleString()} edges · {columns.length} columns</span>}
       </div>
 
       {loading ? (
@@ -127,28 +159,29 @@ export default function EdgeTable({ folder }: Props) {
         <div className="text-slate-500 italic text-sm py-4">No edges match the current filter.</div>
       ) : (
         <>
-          <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-lg">
-            <table className="w-full text-xs border-collapse table-fixed">
+          {/* Every column of edges.parquet, in the file's order and under its own names; wider than the page, it scrolls sideways. */}
+          <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-lg" data-testid="edge-table-scroll">
+            <table className="w-full text-xs border-collapse table-fixed" style={{ minWidth: tableWidth }} data-testid="edge-table">
               <colgroup>
-                {widths.map((w, i) => <col key={i} style={{ width: w }} />)}
+                {columns.map(c => <col key={c} style={{ width: widthOf(c) }} />)}
               </colgroup>
               <thead>
                 <tr className="bg-slate-100 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800">
-                  {COLUMNS.map((h, i) => (
-                    <th key={h} className="relative align-top text-left px-3 py-2 text-slate-500 dark:text-slate-400 font-medium">
-                      {h === 'Source' || h === 'Target' ? (
+                  {columns.map((c, i) => (
+                    <th key={c} data-column={c} className="relative align-top text-left px-3 py-2 text-slate-500 dark:text-slate-400 font-medium">
+                      {c === 'source_fqn' || c === 'target_fqn' ? (
                         <button
-                          onClick={() => toggleSort(h === 'Source' ? 'source_fqn' : 'target_fqn')}
+                          onClick={() => toggleSort(c)}
                           className="flex items-center gap-1 truncate w-full text-left cursor-pointer hover:text-slate-800 dark:hover:text-slate-200"
                         >
-                          <span className="truncate">{h}</span>
-                          {sortIcon(h === 'Source' ? 'source_fqn' : 'target_fqn')}
+                          <span className="truncate font-mono text-[11px]">{c}</span>
+                          {sortIcon(c)}
                         </button>
                       ) : (
-                        <div className="truncate">{h}</div>
+                        <div className="truncate font-mono text-[11px]" title={c}>{c}</div>
                       )}
 
-                      {h === 'Direction' && (
+                      {c === 'edge' && (
                         <select
                           value={filters.direction}
                           onChange={e => setHeaderFilter({ direction: e.target.value })}
@@ -158,7 +191,7 @@ export default function EdgeTable({ folder }: Props) {
                           {(opts?.direction_options ?? ['writes_to', 'read_by']).map(o => <option key={o} value={o}>{o}</option>)}
                         </select>
                       )}
-                      {h === 'Source' && (
+                      {c === 'source_fqn' && (
                         <input
                           type="text"
                           value={filters.sourceSearch}
@@ -167,7 +200,7 @@ export default function EdgeTable({ folder }: Props) {
                           className={headerInputClass}
                         />
                       )}
-                      {h === 'Source Type' && (
+                      {c === 'source_type' && (
                         <select
                           value={filters.sourceType}
                           onChange={e => setHeaderFilter({ sourceType: e.target.value })}
@@ -177,7 +210,7 @@ export default function EdgeTable({ folder }: Props) {
                           {(opts?.source_type_options ?? []).map(o => <option key={o} value={o}>{o}</option>)}
                         </select>
                       )}
-                      {h === 'Target' && (
+                      {c === 'target_fqn' && (
                         <input
                           type="text"
                           value={filters.targetSearch}
@@ -186,7 +219,7 @@ export default function EdgeTable({ folder }: Props) {
                           className={headerInputClass}
                         />
                       )}
-                      {h === 'Target Type' && (
+                      {c === 'target_type' && (
                         <select
                           value={filters.targetType}
                           onChange={e => setHeaderFilter({ targetType: e.target.value })}
@@ -196,28 +229,17 @@ export default function EdgeTable({ folder }: Props) {
                           {(opts?.target_type_options ?? []).map(o => <option key={o} value={o}>{o}</option>)}
                         </select>
                       )}
-                      {i < COLUMNS.length - 1 && <ColResizeHandle onMouseDown={startResize(i)} />}
+                      {i < columns.length - 1 && <ColResizeHandle onMouseDown={startResize(c)} />}
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {data.rows.map((row, i) => (
-                  <tr key={row.edge_id || i} className={`border-b border-slate-200 dark:border-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800/30 ${i % 2 ? 'bg-slate-50 dark:bg-slate-900/20' : ''}`}>
-                    <td className="px-3 py-2 truncate">
-                      <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${row.edge === 'writes_to' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
-                        {row.edge}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 overflow-hidden"><FqnCell value={row.source_fqn} /></td>
-                    <td className="px-3 py-2 text-slate-500 dark:text-slate-400 truncate">{row.source_type}</td>
-                    <td className="px-3 py-2 overflow-hidden"><FqnCell value={row.target_fqn} /></td>
-                    <td className="px-3 py-2 text-slate-500 dark:text-slate-400 truncate">{row.target_type}</td>
-                    <td className="px-3 py-2 font-mono text-slate-700 dark:text-slate-300 truncate">{row.transform_type}</td>
-                    <td className="px-3 py-2 truncate">
-                      <span className={`text-xs px-1.5 py-0.5 rounded ${confidenceColor(row.confidence)}`}>{row.confidence}</span>
-                    </td>
-                    <td className="px-3 py-2 text-slate-500 dark:text-slate-400 truncate">{row.resolution_type}</td>
+                  <tr key={String(row.edge_id || i)} className={`border-b border-slate-200 dark:border-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800/30 ${i % 2 ? 'bg-slate-50 dark:bg-slate-900/20' : ''}`}>
+                    {columns.map(c => (
+                      <td key={c} data-column={c} className="px-3 py-2 overflow-hidden"><Cell column={c} value={row[c]} /></td>
+                    ))}
                   </tr>
                 ))}
               </tbody>
